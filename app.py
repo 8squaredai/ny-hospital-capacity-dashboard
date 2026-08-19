@@ -10,7 +10,7 @@ import streamlit as st
 
 st.set_page_config(page_title="NY Hospital Capacity Dashboard", layout="wide")
 
-DATA_PATH = "data/New_York_State_Statewide_Hospital_Bed_Capacity_20260817.csv"
+DATA_PATH = "data/New_York_State_Statewide_Hospital_Bed_Capacity.csv"
 GEOJSON_PATH = "data/ny_counties.geojson"
 FACILITIES_PATH = "data/ny_health_facilities.csv"
 
@@ -44,7 +44,9 @@ def load_facility_coords(path: str) -> pd.DataFrame:
     )
 
 
-@st.cache_data
+@st.cache_data(ttl="1d")  # the source CSV refreshes daily (see scripts/update_hospital_data.sh);
+# without a TTL, a long-running deployed process would keep serving the
+# data it first loaded with, even after the file on disk changes underneath it.
 def load_data(path: str, facilities_path: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]:
     df = pd.read_csv(path, low_memory=False)
 
