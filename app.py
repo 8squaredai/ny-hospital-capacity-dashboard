@@ -10,7 +10,7 @@ import streamlit as st
 
 st.set_page_config(page_title="NY Hospital Capacity Dashboard", layout="wide")
 
-DATA_PATH = "data/New_York_State_Statewide_Hospital_Bed_Capacity_20260817.csv"
+DATA_PATH = "data/New_York_State_Statewide_Hospital_Bed_Capacity.csv"
 GEOJSON_PATH = "data/ny_counties.geojson"
 FACILITIES_PATH = "data/ny_health_facilities.csv"
 
@@ -44,7 +44,9 @@ def load_facility_coords(path: str) -> pd.DataFrame:
     )
 
 
-@st.cache_data
+@st.cache_data(ttl="1d")  # the source CSV refreshes daily (see scripts/update_hospital_data.sh);
+# without a TTL, a long-running deployed process would keep serving the
+# data it first loaded with, even after the file on disk changes underneath it.
 def load_data(path: str, facilities_path: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp]:
     df = pd.read_csv(path, low_memory=False)
 
@@ -191,9 +193,23 @@ def county_choropleth(plot_df: pd.DataFrame, fips_name_col: str, hover_name_col:
     fig.update_layout(
         margin=dict(l=0, r=0, t=0, b=0),
         paper_bgcolor="#fcfcfb",
-        coloraxis_colorbar=dict(title="Acute Occ. %"),
+        coloraxis_colorbar=dict(title="Acute occupancy (%)"),
     )
     return fig
+
+
+def render_pressure_legend() -> None:
+    items = "".join(
+        f'<span style="display:inline-flex;align-items:center;margin-right:16px;">'
+        f'<span style="width:12px;height:12px;background:{color};display:inline-block;'
+        f'margin-right:5px;border:1px solid #777;"></span>{label}</span>'
+        for (color, _), label in zip(PRESSURE_COLORS, PRIORITY_LABELS)
+    )
+    st.markdown(
+        f'<div style="font-size:13px;color:#52514e;margin:4px 0 10px;">'
+        f'<strong>Acute occupancy pressure</strong>: {items}</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def hex_to_rgba(hex_color: str, alpha: int = 200) -> list[int]:
@@ -319,6 +335,60 @@ def fmt_pct(value: float) -> str:
     return f"{value:.1f}%" if pd.notna(value) else "N/A"
 
 
+def capital_priority_table(
+    history_df: pd.DataFrame,
+    latest_agg: pd.DataFrame,
+    group_col: str,
+    latest_date: pd.Timestamp,
+    window_days: int = 30,
+) -> pd.DataFrame:
+    """Blends current snapshot occupancy with a 30-day sustained average and a
+    trend (30-day avg vs. the 30 days before that) into a single ranking, so a
+    group that's merely having one bad day doesn't outrank one under real,
+    sustained pressure. Trend is only added (not subtracted) when pressure is
+    building -- an easing trend doesn't get credit for "improving" here,
+    since current + sustained load are what matters for a capital decision.
+    """
+    cutoff_recent = latest_date - pd.Timedelta(days=window_days)
+    cutoff_prior = latest_date - pd.Timedelta(days=2 * window_days)
+
+    recent_window = history_df[history_df["As of Date"] > cutoff_recent]
+    prior_window = history_df[
+        (history_df["As of Date"] > cutoff_prior) & (history_df["As of Date"] <= cutoff_recent)
+    ]
+    recent_agg = aggregate_occupancy(recent_window, group_col)
+    prior_agg = aggregate_occupancy(prior_window, group_col)
+
+    table = latest_agg[
+        ["facility_count", "staffed_acute", "available_acute", "Acute Occupancy %", "ICU Occupancy %"]
+    ].copy()
+    table["Acute 30-Day Avg %"] = recent_agg["Acute Occupancy %"]
+    table["Trend (pts)"] = recent_agg["Acute Occupancy %"] - prior_agg["Acute Occupancy %"]
+    table["Capital Priority Score"] = (
+        0.5 * table["Acute Occupancy %"]
+        + 0.5 * table["Acute 30-Day Avg %"]
+        + table["Trend (pts)"].clip(lower=0)
+    )
+    return table.sort_values("Capital Priority Score", ascending=False)
+
+
+def capital_insight_text(name: str, row: pd.Series) -> str:
+    trend = row["Trend (pts)"]
+    if trend > 2:
+        trend_phrase = "pressure has been building over the past month"
+    elif trend < -2:
+        trend_phrase = "though pressure has eased somewhat over the past month"
+    else:
+        trend_phrase = "occupancy has held roughly steady over the past month"
+    return (
+        f"**{name}** — acute occupancy is **{row['Acute Occupancy %']:.1f}%** today, "
+        f"averaging **{row['Acute 30-Day Avg %']:.1f}%** over the past 30 days "
+        f"({trend:+.1f} pts vs. the 30 days before that), and {trend_phrase}. "
+        f"**{row['facility_count']:.0f} hospitals** report only "
+        f"**{row['available_acute']:.0f} staffed acute beds available** combined."
+    )
+
+
 def aggregate_occupancy(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
     """Weighted (sum-of-beds) occupancy per group, not an average of percentages."""
     agg = df.groupby(group_col).agg(
@@ -390,6 +460,7 @@ TAB_NAMES = [
     "Priority Dashboard",
     "NYC Boroughs",
     "Historical Trends",
+    "Capital Investment Insights",
 ]
 # st.tabs() has no memory of which tab was active, so any widget interaction
 # (e.g. the hospital selectbox) reruns the script and resets it to index 0.
@@ -524,41 +595,24 @@ elif active_tab == "Regional Analysis":
         text=region_table["Acute Occupancy %"].round(1).astype(str) + "%",
     )
     fig.update_traces(marker_color="#2a78d6", textposition="outside", cliponaxis=False)
+    fig.update_traces(name="Acute occupancy", showlegend=True)
     fig.update_layout(
         plot_bgcolor="#fcfcfb",
         paper_bgcolor="#fcfcfb",
         font_color="#0b0b0b",
         xaxis=dict(title="Acute Occupancy %", gridcolor="#e1e0d9", zeroline=False),
         yaxis=dict(title=None, gridcolor="#e1e0d9"),
+        legend_title_text="Measure",
         margin=dict(l=10, r=10, t=10, b=10),
         height=max(320, 32 * len(region_table)),
     )
     st.subheader("Acute-Care Occupancy by DOH Region")
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Region Comparison Table")
-    region_display = region_table.rename(
-        columns={
-            "DOH Region": "DOH Region",
-            "facility_count": "Hospitals",
-            "staffed_acute": "Staffed Acute Beds",
-            "occupied_acute": "Occupied Acute Beds",
-            "available_acute": "Available Acute Beds",
-            "staffed_icu": "Staffed ICU Beds",
-            "occupied_icu": "Occupied ICU Beds",
-            "available_icu": "Available ICU Beds",
-        }
-    ).sort_values("Acute Occupancy %", ascending=False)
-    st.dataframe(
-        region_display.style.format(
-            {"Acute Occupancy %": "{:.1f}", "ICU Occupancy %": "{:.1f}"}
-        ).map(pressure_style, subset=["Acute Occupancy %", "ICU Occupancy %"]),
-        use_container_width=True,
-        hide_index=True,
-    )
     st.caption(
-        "Pressure colors are illustrative analytical thresholds (75% / 85% / 95%), "
-        "not medical or regulatory standards. " + OVER_100_NOTE
+        "Hover over a region for its acute and ICU occupancy. Pressure colors are "
+        "illustrative analytical thresholds (75% / 85% / 95%), not medical or "
+        "regulatory standards. " + OVER_100_NOTE
     )
 
 elif active_tab == "Network Analysis":
@@ -635,6 +689,7 @@ elif active_tab == "Priority Dashboard":
         radius=1500,
         elevation_scale=200,
     )
+    render_pressure_legend()
 
     st.subheader("Hospital Priority Ranking")
     priority_cols = [
@@ -682,26 +737,6 @@ elif active_tab == "NYC Boroughs":
     )
 
     borough_table = borough_agg.reset_index().sort_values("Acute Occupancy %", ascending=True)
-
-    fig_nyc = px.bar(
-        borough_table,
-        x="Acute Occupancy %",
-        y="Borough",
-        orientation="h",
-        text=borough_table["Acute Occupancy %"].round(1).astype(str) + "%",
-    )
-    fig_nyc.update_traces(marker_color=ACUTE_ACCENT, textposition="outside", cliponaxis=False)
-    fig_nyc.update_layout(
-        plot_bgcolor="#fcfcfb",
-        paper_bgcolor="#fcfcfb",
-        font_color="#0b0b0b",
-        xaxis=dict(title="Acute Occupancy %", gridcolor="#e1e0d9", zeroline=False),
-        yaxis=dict(title=None, gridcolor="#e1e0d9"),
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=max(280, 40 * len(borough_table)),
-    )
-    st.subheader("Acute-Care Occupancy by Borough")
-    st.plotly_chart(fig_nyc, use_container_width=True)
 
     st.subheader("Borough Comparison Table")
     borough_display = borough_table.rename(
@@ -768,6 +803,7 @@ elif active_tab == "NYC Boroughs":
         radius=120,
         elevation_scale=60,
     )
+    render_pressure_legend()
 
 elif active_tab == "Historical Trends":
     st.caption(
@@ -861,3 +897,122 @@ elif active_tab == "Historical Trends":
     if (hosp_history["Acute Occupancy %"] > 100).any():
         caption_text += " " + OVER_100_NOTE
     st.caption(caption_text)
+
+elif active_tab == "Capital Investment Insights":
+    st.caption(
+        "Synthesizes the occupancy, regional, network, and trend data from the other tabs "
+        "into a ranked view of where sustained bed-capacity pressure is greatest -- the kind "
+        "of signal that informs where public capital financing for hospital construction and "
+        "expansion gets prioritized in New York. The two public institutions most directly "
+        "involved in financing hospital capacity upgrades statewide are the **Dormitory "
+        "Authority of the State of New York (DASNY)**, which issues bonds and manages "
+        "construction financing for the large majority of the state's hospital and healthcare "
+        "capital projects, and the **NYS Department of Health**, which awards capital grants "
+        "(e.g. the Statewide Health Care Facility Transformation Program) that DASNY often "
+        "administers the financing for. This section is a data-driven decision-support signal, "
+        "not an official funding recommendation."
+    )
+
+    region_capital = capital_priority_table(history_df, region_agg, "DOH Region", latest_date)
+    top_region_name = region_capital.index[0]
+    top_region = region_capital.iloc[0]
+
+    st.subheader("Statewide Snapshot")
+    s1, s2, s3 = st.columns(3)
+    s1.metric("Statewide Acute Occupancy", f"{state_acute_occupancy:.1f}%")
+    s2.metric(
+        "Highest-Priority Region",
+        top_region_name,
+        delta=f"{top_region['Acute Occupancy %']:.1f}% acute occupancy",
+        delta_color="off",
+    )
+    s3.metric(
+        "Available Acute Beds There",
+        f"{top_region['available_acute']:,.0f}",
+        delta=f"across {top_region['facility_count']:.0f} hospitals",
+        delta_color="off",
+    )
+
+    st.subheader("Regions Ranked by Capital Investment Priority")
+    st.caption(
+        "Priority score blends current occupancy, the 30-day sustained average, and the "
+        "30-day trend, so a region under real ongoing strain outranks one having a single "
+        "bad day. " + OVER_100_NOTE
+    )
+    region_display = region_capital.rename(
+        columns={
+            "facility_count": "Hospitals",
+            "staffed_acute": "Staffed Acute Beds",
+            "available_acute": "Available Acute Beds",
+        }
+    ).reset_index().rename(columns={"DOH Region": "DOH Region"})
+    st.dataframe(
+        region_display.style.format(
+            {
+                "Acute Occupancy %": "{:.1f}",
+                "ICU Occupancy %": "{:.1f}",
+                "Acute 30-Day Avg %": "{:.1f}",
+                "Trend (pts)": "{:+.1f}",
+                "Capital Priority Score": "{:.1f}",
+            }
+        ).map(pressure_style, subset=["Acute Occupancy %", "ICU Occupancy %", "Acute 30-Day Avg %"]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    st.subheader("Top Candidate Regions for Capital Review")
+    for region_name, row in region_capital.head(3).iterrows():
+        st.markdown(f"- {capital_insight_text(region_name, row)}")
+
+    st.subheader(f"Hospitals Driving Priority in {top_region_name}")
+    st.caption(
+        "The individual facilities within the top-ranked region that would likely be the "
+        "focus of any capital review -- ranked by current acute occupancy."
+    )
+    region_hospital_cols = [
+        "Facility Name",
+        "Facility County",
+        "Facility Network",
+        "Acute Occupancy %",
+        "ICU Occupancy %",
+        "Total Staffed Acute Care Beds Available",
+    ]
+    region_hospitals = (
+        df[df["DOH Region"] == top_region_name][region_hospital_cols]
+        .sort_values("Acute Occupancy %", ascending=False)
+        .head(10)
+        .reset_index(drop=True)
+    )
+    st.dataframe(
+        region_hospitals.style.format(
+            {"Acute Occupancy %": "{:.1f}", "ICU Occupancy %": "{:.1f}"}
+        ).map(pressure_style, subset=["Acute Occupancy %", "ICU Occupancy %"]),
+        use_container_width=True,
+    )
+
+    st.subheader("Networks Ranked by Capital Investment Priority")
+    st.caption(
+        "Network-level view -- useful because a single capital award to a health system can "
+        "often expand capacity across several affiliated hospitals at once."
+    )
+    network_capital = capital_priority_table(history_df, network_agg, "Facility Network", latest_date)
+    network_display = network_capital.rename(
+        columns={
+            "facility_count": "Hospitals",
+            "staffed_acute": "Staffed Acute Beds",
+            "available_acute": "Available Acute Beds",
+        }
+    ).reset_index()
+    st.dataframe(
+        network_display.head(10).style.format(
+            {
+                "Acute Occupancy %": "{:.1f}",
+                "ICU Occupancy %": "{:.1f}",
+                "Acute 30-Day Avg %": "{:.1f}",
+                "Trend (pts)": "{:+.1f}",
+                "Capital Priority Score": "{:.1f}",
+            }
+        ).map(pressure_style, subset=["Acute Occupancy %", "ICU Occupancy %", "Acute 30-Day Avg %"]),
+        use_container_width=True,
+        hide_index=True,
+    )
