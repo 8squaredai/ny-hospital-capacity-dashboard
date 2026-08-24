@@ -8,11 +8,12 @@ import plotly.express as px
 import pydeck as pdk
 import streamlit as st
 
-st.set_page_config(page_title="NY Hospital Capacity Dashboard", layout="wide")
+st.set_page_config(page_title="NY Hospital Capacity", layout="wide")
 
-DATA_PATH = "data/New_York_State_Statewide_Hospital_Bed_Capacity_20260817.csv"
-GEOJSON_PATH = "data/ny_counties.geojson"
+DATA_PATH = "data/hospital_history.csv"
 FACILITIES_PATH = "data/ny_health_facilities.csv"
+GEOJSON_PATH = "data/ny_counties.geojson"
+SOURCE_URL = "https://health.data.ny.gov/Health/New-York-State-Statewide-Hospital-Bed-Capacity/2dbc-sqe7"
 
 NUMERIC_COLS = [
     "Total Staffed Acute Care Beds",
@@ -23,23 +24,83 @@ NUMERIC_COLS = [
     "Total Staffed ICU Beds Currently Available",
 ]
 
+# Maps DOH's verbose regional-office names to the short labels used throughout the UI.
+REGION_LABELS = {
+    "CAPITAL DISTRICT REGIONAL OFFICE": "Capital District",
+    "CENTRAL NEW YORK REGIONAL OFFICE": "Central New York",
+    "METROPOLITAN AREA REGIONAL OFFICE - LONG ISLAND": "Long Island",
+    "METROPOLITAN AREA REGIONAL OFFICE - NEW ROCHELLE": "Hudson Valley",
+    "METROPOLITAN AREA REGIONAL OFFICE - NEW YORK CITY": "New York City",
+    "WESTERN REGIONAL OFFICE - BUFFALO": "Western NY (Buffalo)",
+    "WESTERN REGIONAL OFFICE - ROCHESTER": "Western NY (Rochester)",
+}
+NYC_BOROUGH_MAP = {
+    "NEW YORK": "Manhattan",
+    "KINGS": "Brooklyn",
+    "BRONX": "Bronx",
+    "QUEENS": "Queens",
+    "RICHMOND": "Staten Island",
+}
+
+# Analytical/app thresholds only -- not medical or regulatory standards. Matches the
+# three-tier system documented on the About Data page (Available / High occupancy / Critical).
+STATUS_THRESHOLDS = (75, 90)
+STATUS_LABELS = ["Available", "High occupancy", "Critical"]
+STATUS_COLORS = {
+    0: ("#dcf5e3", "#1a7a3c"),
+    1: ("#fdecc8", "#8a5b00"),
+    2: ("#fbdada", "#b42318"),
+}
+STATUS_MAP_COLORS = {0: "#2fa84f", 1: "#e0a52c", 2: "#d1453b"}
+
+# A few hospitals report occupancy over 100% -- verified against the source data, not a
+# calculation bug (Occupied + Available == Staffed holds exactly). Causes vary by facility:
+# patient boarding beyond the staffed bed count, short-notice staffing reductions, or a
+# "staffed beds" figure that's stale or narrower in definition than "occupied".
+OVER_100_NOTE = (
+    "Occupancy can exceed 100% for some hospitals -- this reflects patient boarding, "
+    "short-notice staffing reductions, or inconsistencies in self-reported facility "
+    "data, not a calculation error."
+)
+
+METRICS = {
+    "Acute Occupancy %": dict(kind="pct", num="Total Staffed Acute Care Beds Occupied", den="Total Staffed Acute Care Beds"),
+    "ICU Occupancy %": dict(kind="pct", num="Total Staffed ICU Beds Currently Occupied", den="Total Staffed ICU Beds"),
+    "Available Acute Beds": dict(kind="sum", col="Total Staffed Acute Care Beds Available"),
+    "Available ICU Beds": dict(kind="sum", col="Total Staffed ICU Beds Currently Available"),
+}
+
+ACCENT = "#2a78d6"
+
 
 @st.cache_data
 def load_facility_coords(path: str) -> pd.DataFrame:
-    """NY DOH's facility directory covers every licensed facility type (hospitals,
-    nursing homes, clinics, ...), keyed by Facility ID -- the same identifier as
-    our bed-capacity data's Facility PFI. A handful of IDs appear as exact
-    duplicate rows (same coordinates repeated), so dedupe before joining.
+    """NY DOH's facility directory covers every licensed facility type (hospitals, nursing
+    homes, clinics, ...), keyed by Facility ID -- the same identifier as our bed-capacity
+    data's Facility PFI. A handful of IDs appear as exact duplicate rows, so dedupe first.
     """
     fac = pd.read_csv(path, low_memory=False)
     fac = fac.drop_duplicates(subset="Facility ID", keep="first")
-    fac = fac[["Facility ID", "Facility Latitude", "Facility Longitude", "Facility Zip Code"]]
+    fac = fac[
+        [
+            "Facility ID",
+            "Facility Latitude",
+            "Facility Longitude",
+            "Facility Zip Code",
+            "Facility Address 1",
+            "Facility City",
+            "Description",
+        ]
+    ]
     return fac.rename(
         columns={
             "Facility ID": "Facility PFI",
             "Facility Latitude": "Latitude",
             "Facility Longitude": "Longitude",
             "Facility Zip Code": "Zip Code",
+            "Facility Address 1": "Address",
+            "Facility City": "City",
+            "Description": "Hospital Type",
         }
     )
 
@@ -49,151 +110,238 @@ def load_data(path: str, facilities_path: str) -> tuple[pd.DataFrame, pd.DataFra
     df = pd.read_csv(path, low_memory=False)
 
     for col in NUMERIC_COLS:
-        df[col] = pd.to_numeric(
-            df[col].astype(str).str.replace(",", "", regex=False), errors="coerce"
-        )
+        df[col] = pd.to_numeric(df[col].astype(str).str.replace(",", "", regex=False), errors="coerce")
 
     df["As of Date"] = pd.to_datetime(df["As of Date"], format="%m/%d/%Y")
     df = df.drop_duplicates(subset=["Facility PFI", "As of Date"], keep="last")
 
     staffed_acute = df["Total Staffed Acute Care Beds"].replace(0, np.nan)
     staffed_icu = df["Total Staffed ICU Beds"].replace(0, np.nan)
-    df["Acute Occupancy %"] = (
-        df["Total Staffed Acute Care Beds Occupied"] / staffed_acute * 100
-    )
-    df["ICU Occupancy %"] = (
-        df["Total Staffed ICU Beds Currently Occupied"] / staffed_icu * 100
-    )
+    df["Acute Occupancy %"] = df["Total Staffed Acute Care Beds Occupied"] / staffed_acute * 100
+    df["ICU Occupancy %"] = df["Total Staffed ICU Beds Currently Occupied"] / staffed_icu * 100
 
-    # Attach Latitude/Longitude/Zip Code here, before slicing to the latest
-    # date, so the full history and the latest-date snapshot both carry it.
-    # A left join means a hospital with no match (or a match with no
-    # coordinates on file) simply comes through as NaN -- nothing to handle
-    # explicitly, the map/analysis code downstream just filters on that.
-    facility_coords = load_facility_coords(facilities_path)
-    df = df.merge(facility_coords, on="Facility PFI", how="left")
+    # Attach location/type here, before slicing to the latest date, so both the full
+    # history and the latest-date snapshot carry it. A left join means a hospital with
+    # no match simply comes through as NaN -- the map/filters downstream just handle that.
+    facility_info = load_facility_coords(facilities_path)
+    df = df.merge(facility_info, on="Facility PFI", how="left")
+    df["Region"] = df["DOH Region"].map(REGION_LABELS).fillna("Unknown")
+    df["Borough"] = df["Facility County"].map(NYC_BOROUGH_MAP)
+    df["Hospital Type"] = df["Hospital Type"].fillna("Unknown")
 
-    # The downloaded CSV is a full historical export (one row per facility per
-    # reporting date). Keep the full history for trend analysis, plus a
-    # latest-date snapshot for the current-state tabs.
     latest_date = df["As of Date"].max()
     latest_df = df[df["As of Date"] == latest_date].copy()
 
     return df, latest_df, latest_date
 
 
-# Analytical/app thresholds only -- not medical or regulatory standards.
-PRESSURE_THRESHOLDS = (75, 85, 95)
-PRESSURE_COLORS = [
-    ("#0ca30c", "white"),  # Low
-    ("#fab219", "black"),  # Moderate
-    ("#ec835a", "black"),  # High
-    ("#d03b3b", "white"),  # Critical
-]
-
-# A few hospitals report occupancy over 100% -- verified against the source
-# data, not a calculation bug (Occupied + Available == Staffed holds exactly).
-# Causes vary by facility: patient boarding beyond the staffed bed count,
-# short-notice staffing reductions, or a "staffed beds" figure that's stale
-# or narrower in definition than the "occupied" count it's divided into.
-OVER_100_NOTE = (
-    "Occupancy can exceed 100% for some hospitals -- this reflects patient "
-    "boarding, short-notice staffing reductions, or inconsistencies in "
-    "self-reported facility data, not a calculation error."
-)
-
-ACUTE_ACCENT = "#2a78d6"  # categorical slot 1 (blue) -- identifies the Acute group
-ICU_ACCENT = "#eb6834"  # categorical slot 2 (orange) -- identifies the ICU group
-
-NYC_BOROUGH_MAP = {
-    "NEW YORK": "Manhattan",
-    "KINGS": "Brooklyn",
-    "BRONX": "Bronx",
-    "QUEENS": "Queens",
-    "RICHMOND": "Staten Island",
-}
-
-
-def pressure_bucket(pct: float) -> int | None:
+def status_bucket(pct: float) -> int | None:
     if pd.isna(pct):
         return None
-    low, mid, high = PRESSURE_THRESHOLDS
+    low, high = STATUS_THRESHOLDS
     if pct >= high:
-        return 3
-    if pct >= mid:
         return 2
     if pct >= low:
         return 1
     return 0
 
 
-def pressure_style(pct: float) -> str:
-    bucket = pressure_bucket(pct)
-    if bucket is None:
-        return ""
-    bg, fg = PRESSURE_COLORS[bucket]
-    return f"background-color: {bg}; color: {fg}"
-
-
-PRIORITY_LABELS = ["Low", "Moderate", "High", "Critical"]
-
-
-def priority_bucket(acute_pct: float, icu_pct: float) -> int | None:
-    """Worst-case tier across acute and ICU pressure -- a hospital high on either counts."""
-    buckets = [b for b in (pressure_bucket(acute_pct), pressure_bucket(icu_pct)) if b is not None]
+def worst_status_bucket(acute_pct: float, icu_pct: float) -> int | None:
+    """A hospital high on either acute or ICU counts -- worst case, not an average."""
+    buckets = [b for b in (status_bucket(acute_pct), status_bucket(icu_pct)) if b is not None]
     return max(buckets) if buckets else None
 
 
-def priority_label(bucket: int | None) -> str:
-    # Bucket arrives as a pandas Series value: None mixed with int upcasts the
-    # whole column to float64, so a valid bucket shows up as e.g. 3.0, not 3.
-    if pd.isna(bucket):
+def status_label(bucket: int | None) -> str:
+    if bucket is None or pd.isna(bucket):
         return "N/A"
-    return PRIORITY_LABELS[int(bucket)]
+    return STATUS_LABELS[int(bucket)]
 
 
-def priority_row_style(row: pd.Series) -> list[str]:
-    bucket = priority_bucket(row["Acute Occupancy %"], row["ICU Occupancy %"])
+def status_cell_style(label: str) -> str:
+    if label not in STATUS_LABELS:
+        return ""
+    bg, fg = STATUS_COLORS[STATUS_LABELS.index(label)]
+    return f"background-color: {bg}; color: {fg}; border-radius: 999px; font-weight: 600; text-align: center;"
+
+
+def status_badge_html(bucket: int | None, uppercase: bool = False, suffix: str = "") -> str:
     if bucket is None:
-        style = ""
+        bg, fg, text = "#e7e6e2", "#52514e", "N/A"
     else:
-        bg, fg = PRESSURE_COLORS[bucket]
-        style = f"background-color: {bg}; color: {fg}"
-    return [style if col == "Priority" else "" for col in row.index]
-
-
-@st.cache_data
-def load_geojson(path: str) -> dict:
-    with open(path) as f:
-        return json.load(f)
-
-
-GEOJSON = load_geojson(GEOJSON_PATH)
-FIPS_LOOKUP = {f["properties"]["NAME"].upper(): f["id"] for f in GEOJSON["features"]}
-SEQUENTIAL_BLUE = ["#cde2fb", "#6da7ec", "#256abf", "#0d366b"]  # one hue, light -> dark
-
-
-def county_choropleth(plot_df: pd.DataFrame, fips_name_col: str, hover_name_col: str | None = None):
-    plot_df = plot_df.copy()
-    plot_df["fips"] = plot_df[fips_name_col].str.upper().map(FIPS_LOOKUP)
-    plot_df = plot_df.dropna(subset=["fips"])
-    fig = px.choropleth(
-        plot_df,
-        geojson=GEOJSON,
-        locations="fips",
-        featureidkey="id",
-        color="Acute Occupancy %",
-        color_continuous_scale=SEQUENTIAL_BLUE,
-        hover_name=hover_name_col or fips_name_col,
-        hover_data={"fips": False, "Acute Occupancy %": ":.1f", "ICU Occupancy %": ":.1f"},
+        bg, fg = STATUS_COLORS[bucket]
+        text = STATUS_LABELS[bucket] + suffix
+    if uppercase:
+        text = text.upper()
+    return (
+        f'<span style="background:{bg};color:{fg};padding:6px 16px;border-radius:999px;'
+        f'font-weight:700;font-size:13px;white-space:nowrap;">{text}</span>'
     )
-    fig.update_geos(fitbounds="locations", visible=False)
+
+
+def fmt_pct(value: float) -> str:
+    return f"{value:.1f}%" if pd.notna(value) else "N/A"
+
+
+def fmt_int(value: float) -> str:
+    return f"{value:,.0f}" if pd.notna(value) else "N/A"
+
+
+def kpi_card(label: str, value: str, bucket: int | None = None) -> None:
+    if bucket is None:
+        bg, fg = "#fcfcfb", "#0b0b0b"
+        border = "1px solid #e1e0d9"
+    else:
+        bg, fg = STATUS_COLORS[bucket]
+        border = "none"
+    st.markdown(
+        f"""
+        <div style="background:{bg};border:{border};border-radius:10px;
+                     padding:16px 18px;margin-bottom:10px;">
+            <div style="font-size:28px;color:{fg};font-weight:700;">{value}</div>
+            <div style="font-size:13px;color:{fg};opacity:0.85;margin-top:2px;">{label}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def aggregate_occupancy(rows: pd.DataFrame, group_col: str) -> pd.DataFrame:
+    """Weighted (sum-of-beds) occupancy per group, not an average of percentages."""
+    agg = rows.groupby(group_col).agg(
+        facility_count=("Facility PFI", "count"),
+        staffed_acute=("Total Staffed Acute Care Beds", "sum"),
+        occupied_acute=("Total Staffed Acute Care Beds Occupied", "sum"),
+        available_acute=("Total Staffed Acute Care Beds Available", "sum"),
+        staffed_icu=("Total Staffed ICU Beds", "sum"),
+        occupied_icu=("Total Staffed ICU Beds Currently Occupied", "sum"),
+        available_icu=("Total Staffed ICU Beds Currently Available", "sum"),
+    )
+    agg["Acute Occupancy %"] = agg["occupied_acute"] / agg["staffed_acute"].replace(0, np.nan) * 100
+    agg["ICU Occupancy %"] = agg["occupied_icu"] / agg["staffed_icu"].replace(0, np.nan) * 100
+    return agg
+
+
+def metric_snapshot(rows: pd.DataFrame, metric: str, group_col: str | None = None):
+    """Value of a METRICS entry, either statewide (group_col=None) or grouped."""
+    spec = METRICS[metric]
+    if group_col is None:
+        if spec["kind"] == "pct":
+            num, den = rows[spec["num"]].sum(), rows[spec["den"]].sum()
+            return num / den * 100 if den else np.nan
+        return rows[spec["col"]].sum()
+
+    if spec["kind"] == "pct":
+        g = rows.groupby(group_col)[[spec["num"], spec["den"]]].sum()
+        return (g[spec["num"]] / g[spec["den"]].replace(0, np.nan) * 100).rename(metric)
+    return rows.groupby(group_col)[spec["col"]].sum().rename(metric)
+
+
+def metric_timeseries(history: pd.DataFrame, metric: str) -> pd.DataFrame:
+    spec = METRICS[metric]
+    if spec["kind"] == "pct":
+        g = history.groupby("As of Date")[[spec["num"], spec["den"]]].sum().reset_index()
+        g[metric] = g[spec["num"]] / g[spec["den"]].replace(0, np.nan) * 100
+    else:
+        g = history.groupby("As of Date")[spec["col"]].sum().reset_index().rename(columns={spec["col"]: metric})
+    return g[["As of Date", metric]]
+
+
+def plain_layout(fig, height: int | None = None) -> None:
     fig.update_layout(
-        margin=dict(l=0, r=0, t=0, b=0),
+        plot_bgcolor="#fcfcfb",
         paper_bgcolor="#fcfcfb",
-        coloraxis_colorbar=dict(title="Acute Occ. %"),
+        font_color="#0b0b0b",
+        margin=dict(l=10, r=10, t=10, b=10),
     )
-    return fig
+    if height:
+        fig.update_layout(height=height)
+
+
+def searchable_text(rows: pd.DataFrame) -> pd.Series:
+    return (
+        rows["Facility Name"].fillna("")
+        + " "
+        + rows["Facility County"].fillna("")
+        + " "
+        + rows["Borough"].fillna("")
+    ).str.lower()
+
+
+def filter_bar(rows: pd.DataFrame, key_prefix: str, search_placeholder: str) -> pd.DataFrame:
+    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    with c1:
+        search = st.text_input(search_placeholder, key=f"{key_prefix}_search", label_visibility="collapsed", placeholder=search_placeholder)
+    with c2:
+        region = st.selectbox("Region", ["All regions"] + sorted(rows["Region"].unique()), key=f"{key_prefix}_region")
+    with c3:
+        htype = st.selectbox("Hospital type", ["All types"] + sorted(rows["Hospital Type"].unique()), key=f"{key_prefix}_type")
+    with c4:
+        status = st.selectbox("Capacity status", ["All statuses"] + STATUS_LABELS, key=f"{key_prefix}_status")
+
+    filtered = rows.copy()
+    if search:
+        filtered = filtered[searchable_text(filtered).str.contains(search.lower())]
+    if region != "All regions":
+        filtered = filtered[filtered["Region"] == region]
+    if htype != "All types":
+        filtered = filtered[filtered["Hospital Type"] == htype]
+    if status != "All statuses":
+        bucket = STATUS_LABELS.index(status)
+        filtered = filtered[
+            [worst_status_bucket(a, i) == bucket for a, i in zip(filtered["Acute Occupancy %"], filtered["ICU Occupancy %"])]
+        ]
+    return filtered
+
+
+def open_detail(pfi, return_page: str) -> None:
+    st.session_state.detail_pfi = pfi
+    st.session_state.return_page = return_page
+    st.rerun()
+
+
+def render_marker_map(rows: pd.DataFrame, key: str, zoom: float = 5.7, center: dict | None = None) -> None:
+    map_df = rows.dropna(subset=["Latitude", "Longitude"]).copy()
+    excluded = len(rows) - len(map_df)
+    if map_df.empty:
+        st.info("No hospital coordinates available for this selection.")
+        return
+
+    map_df["Status Bucket"] = [
+        worst_status_bucket(a, i) for a, i in zip(map_df["Acute Occupancy %"], map_df["ICU Occupancy %"])
+    ]
+    map_df["Status"] = map_df["Status Bucket"].apply(status_label)
+    map_df["Occupancy Label"] = map_df["Acute Occupancy %"].apply(fmt_pct)
+
+    fig = px.scatter_map(
+        map_df,
+        lat="Latitude",
+        lon="Longitude",
+        color="Status",
+        color_discrete_map={STATUS_LABELS[b]: c for b, c in STATUS_MAP_COLORS.items()},
+        category_orders={"Status": STATUS_LABELS},
+        hover_name="Facility Name",
+        hover_data={"Latitude": False, "Longitude": False, "Status": True, "Occupancy Label": True},
+        custom_data=["Facility PFI"],
+        zoom=zoom,
+        center=center,
+        height=460,
+        map_style="open-street-map",
+    )
+    fig.update_traces(marker=dict(size=11))
+    fig.update_layout(margin=dict(l=0, r=0, t=0, b=0), legend_title_text="")
+    event = st.plotly_chart(fig, width="stretch", on_select="rerun", key=key)
+
+    caption = f"{len(map_df)} hospitals shown."
+    if excluded:
+        caption += f" {excluded} excluded (no coordinates on file)."
+    caption += " Click a marker to open its detail page."
+    st.caption(caption)
+
+    points = event.get("selection", {}).get("points", []) if event else []
+    if points:
+        pfi = points[0]["customdata"][0]
+        open_detail(pfi, st.session_state.page)
 
 
 def hex_to_rgba(hex_color: str, alpha: int = 200) -> list[int]:
@@ -202,53 +350,27 @@ def hex_to_rgba(hex_color: str, alpha: int = 200) -> list[int]:
     return [r, g, b, alpha]
 
 
-def weekly_slider(history: pd.DataFrame, latest: pd.Timestamp, key: str) -> pd.Timestamp:
-    """Weekly steps anchored on the latest date, so "today" is always a slider
-    option and we don't force scrubbing through all 340 daily positions."""
-    earliest = history["As of Date"].min()
-    options = []
-    d = latest
-    while d >= earliest:
-        options.append(d)
-        d -= pd.Timedelta(days=7)
-    options = sorted(options)
-    return st.select_slider(
-        "Select week",
-        options=options,
-        value=latest,
-        format_func=lambda x: x.strftime("%b %d, %Y"),
-        key=key,
-    )
-
-
-def render_hospital_3d_map(
-    day_subset: pd.DataFrame,
-    view_state: pdk.ViewState,
-    subtitle_col: str,
-    region_label: str,
-    radius: int,
-    elevation_scale: int,
-) -> None:
-    """One 3D bar per hospital at its real coordinates; height and color both
-    encode acute occupancy pressure. Hospitals with no coordinates on file are
-    dropped from the plot but counted in the caption, never silently merged in."""
-    map_df = day_subset.dropna(subset=["Latitude", "Longitude"]).copy()
-    excluded_count = len(day_subset) - len(map_df)
-
+def render_3d_map(rows: pd.DataFrame, radius: int = 1500, elevation_scale: int = 200) -> None:
+    """One 3D bar per hospital at its real coordinates; height and color both encode acute
+    occupancy pressure. No native click-to-select in pydeck, unlike the marker map, so this
+    view is for scanning statewide shape rather than drilling into a specific hospital."""
+    map_df = rows.dropna(subset=["Latitude", "Longitude"]).copy()
+    excluded = len(rows) - len(map_df)
     if map_df.empty:
-        st.info("No hospital coordinates available for this date.")
+        st.info("No hospital coordinates available for this selection.")
         return
 
-    map_df["bucket"] = map_df["Acute Occupancy %"].apply(pressure_bucket)
+    map_df["bucket"] = [
+        worst_status_bucket(a, i) for a, i in zip(map_df["Acute Occupancy %"], map_df["ICU Occupancy %"])
+    ]
     map_df["fill_color"] = map_df["bucket"].apply(
-        lambda b: hex_to_rgba(PRESSURE_COLORS[int(b)][0]) if pd.notna(b) else [137, 135, 129, 160]
+        lambda b: hex_to_rgba(STATUS_MAP_COLORS[int(b)]) if pd.notna(b) else [137, 135, 129, 160]
     )
-    # Bar height is capped at 100% so the handful of hospitals reporting over
-    # 100% (see OVER_100_NOTE) don't visually dwarf every other bar -- color
-    # and the tooltip label still reflect the true, uncapped percentage.
+    # Bar height capped at 100% so the handful of hospitals reporting over 100% (see
+    # OVER_100_NOTE) don't visually dwarf every other bar -- color and the tooltip still
+    # reflect the true, uncapped percentage.
     map_df["elevation"] = map_df["Acute Occupancy %"].fillna(0).clip(upper=100)
     map_df["occupancy_label"] = map_df["Acute Occupancy %"].apply(fmt_pct)
-    map_df["subtitle"] = map_df[subtitle_col]
 
     layer = pdk.Layer(
         "ColumnLayer",
@@ -264,600 +386,436 @@ def render_hospital_3d_map(
     st.pydeck_chart(
         pdk.Deck(
             layers=[layer],
-            initial_view_state=view_state,
+            initial_view_state=pdk.ViewState(latitude=42.9, longitude=-75.5, zoom=6, pitch=45, bearing=0),
             map_style=None,
-            tooltip={"text": "{Facility Name} ({subtitle})\nAcute occupancy: {occupancy_label}"},
+            tooltip={"text": "{Facility Name}\nAcute occupancy: {occupancy_label}"},
         )
     )
-    st.caption(
-        f"{len(map_df)} of {len(day_subset)} reporting {region_label} hospitals mapped"
-        + (f" ({excluded_count} excluded, no coordinates on file)." if excluded_count else ".")
-        + " Bar height and color both encode acute occupancy pressure -- taller and redder "
-        "means more pressure (bar height is capped at 100% so outliers stay readable; "
-        "color and the hover label still show the true value). Pressure colors are "
-        "illustrative analytical thresholds (75% / 85% / 95%), not medical or "
-        "regulatory standards. " + OVER_100_NOTE
+    caption = f"{len(map_df)} hospitals mapped."
+    if excluded:
+        caption += f" {excluded} excluded (no coordinates on file)."
+    caption += " Bar height and color both encode acute occupancy pressure."
+    st.caption(caption)
+
+
+@st.cache_data
+def load_geojson(path: str) -> dict:
+    with open(path) as f:
+        return json.load(f)
+
+
+GEOJSON = load_geojson(GEOJSON_PATH)
+FIPS_LOOKUP = {f["properties"]["NAME"].upper(): f["id"] for f in GEOJSON["features"]}
+SEQUENTIAL_BLUE = ["#cde2fb", "#6da7ec", "#256abf", "#0d366b"]
+
+
+def render_choropleth_map(rows: pd.DataFrame) -> None:
+    county_agg = aggregate_occupancy(rows, "Facility County").reset_index()
+    county_agg["fips"] = county_agg["Facility County"].str.upper().map(FIPS_LOOKUP)
+    plot_df = county_agg.dropna(subset=["fips"])
+    if plot_df.empty:
+        st.info("No county data available for this selection.")
+        return
+
+    fig = px.choropleth(
+        plot_df,
+        geojson=GEOJSON,
+        locations="fips",
+        featureidkey="id",
+        color="Acute Occupancy %",
+        color_continuous_scale=SEQUENTIAL_BLUE,
+        hover_name="Facility County",
+        hover_data={"fips": False, "Acute Occupancy %": ":.1f", "ICU Occupancy %": ":.1f"},
+        height=460,
     )
-
-
-def kpi_card(label: str, value: str, accent: str) -> None:
-    """Neutral KPI tile with a colored top border identifying its group (Acute/ICU)."""
-    st.markdown(
-        f"""
-        <div style="background:#fcfcfb;border:1px solid #e1e0d9;
-                     border-top:4px solid {accent};border-radius:10px;
-                     padding:14px 16px;margin-bottom:10px;">
-            <div style="font-size:13px;color:#52514e;font-weight:600;
-                         text-transform:uppercase;letter-spacing:0.02em;">{label}</div>
-            <div style="font-size:28px;color:#0b0b0b;font-weight:700;margin-top:4px;">
-                {value}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+    fig.update_geos(fitbounds="locations", visible=False)
+    fig.update_layout(
+        margin=dict(l=0, r=0, t=0, b=0),
+        paper_bgcolor="#fcfcfb",
+        coloraxis_colorbar=dict(title="Acute Occ. %"),
     )
+    st.plotly_chart(fig, width="stretch")
+    st.caption(f"{len(plot_df)} counties shown, colored by weighted acute occupancy. Choropleth has no drill-down -- use the Markers view to open a hospital's detail page.")
 
 
-def kpi_badge(label: str, value: str, pct: float) -> None:
-    """Occupancy KPI tile, filled with its pressure status color."""
-    bucket = pressure_bucket(pct)
-    bg, fg = PRESSURE_COLORS[bucket] if bucket is not None else ("#898781", "white")
-    st.markdown(
-        f"""
-        <div style="background:{bg};color:{fg};border-radius:10px;
-                     padding:14px 16px;margin-bottom:10px;">
-            <div style="font-size:13px;font-weight:600;text-transform:uppercase;
-                         letter-spacing:0.02em;opacity:0.85;">{label}</div>
-            <div style="font-size:28px;font-weight:700;margin-top:4px;">{value}</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
+def render_hospital_table(rows: pd.DataFrame, key: str, columns: list[str] | None = None) -> None:
+    cols = columns or ["Facility Name", "Region", "Total Staffed Acute Care Beds Available", "Total Staffed ICU Beds Currently Available", "Acute Occupancy %", "Status"]
+    table = rows.copy()
+    table["Status"] = [status_label(worst_status_bucket(a, i)) for a, i in zip(table["Acute Occupancy %"], table["ICU Occupancy %"])]
+    table = table.sort_values("Acute Occupancy %", ascending=False).reset_index(drop=True)
+    display = table[cols].rename(
+        columns={
+            "Facility Name": "Hospital",
+            "Total Staffed Acute Care Beds Available": "Beds free",
+            "Total Staffed ICU Beds Currently Available": "ICU free",
+            "Acute Occupancy %": "Occupancy",
+        }
     )
-
-
-def fmt_pct(value: float) -> str:
-    return f"{value:.1f}%" if pd.notna(value) else "N/A"
-
-
-def aggregate_occupancy(df: pd.DataFrame, group_col: str) -> pd.DataFrame:
-    """Weighted (sum-of-beds) occupancy per group, not an average of percentages."""
-    agg = df.groupby(group_col).agg(
-        facility_count=("Facility PFI", "count"),
-        staffed_acute=("Total Staffed Acute Care Beds", "sum"),
-        occupied_acute=("Total Staffed Acute Care Beds Occupied", "sum"),
-        available_acute=("Total Staffed Acute Care Beds Available", "sum"),
-        staffed_icu=("Total Staffed ICU Beds", "sum"),
-        occupied_icu=("Total Staffed ICU Beds Currently Occupied", "sum"),
-        available_icu=("Total Staffed ICU Beds Currently Available", "sum"),
+    st.caption(f"{len(display)} hospitals — sorted by occupancy. Click a column header to re-sort.")
+    event = st.dataframe(
+        display.style.format({"Occupancy": "{:.1f}%"}).map(status_cell_style, subset=["Status"]),
+        width="stretch",
+        hide_index=True,
+        on_select="rerun",
+        selection_mode="single-row",
+        key=key,
     )
-    agg["Acute Occupancy %"] = agg["occupied_acute"] / agg["staffed_acute"].replace(0, np.nan) * 100
-    agg["ICU Occupancy %"] = agg["occupied_icu"] / agg["staffed_icu"].replace(0, np.nan) * 100
-    return agg
+    rows_selected = event.get("selection", {}).get("rows", []) if event else []
+    if rows_selected:
+        pfi = table.iloc[rows_selected[0]]["Facility PFI"]
+        open_detail(pfi, st.session_state.page)
 
+
+# ---------------------------------------------------------------------------
+# Data load
+# ---------------------------------------------------------------------------
 
 history_df, df, latest_date = load_data(DATA_PATH, FACILITIES_PATH)
-region_agg = aggregate_occupancy(df, "DOH Region")
-network_agg = aggregate_occupancy(df, "Facility Network")
-county_agg = aggregate_occupancy(df, "Facility County")
 
-statewide_daily = (
-    history_df.groupby("As of Date")
-    .agg(
-        staffed_acute=("Total Staffed Acute Care Beds", "sum"),
-        occupied_acute=("Total Staffed Acute Care Beds Occupied", "sum"),
-        staffed_icu=("Total Staffed ICU Beds", "sum"),
-        occupied_icu=("Total Staffed ICU Beds Currently Occupied", "sum"),
-    )
-    .reset_index()
+if "page" not in st.session_state:
+    st.session_state.page = "Overview"
+if "detail_pfi" not in st.session_state:
+    st.session_state.detail_pfi = None
+if "return_page" not in st.session_state:
+    st.session_state.return_page = "Overview"
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+
+st.markdown(
+    f"""
+    <div style="background:#132a4e;margin:-1rem -1rem 1rem -1rem;padding:20px 2rem;
+                 display:flex;justify-content:space-between;align-items:flex-end;">
+        <div>
+            <div style="color:white;font-size:26px;font-weight:800;">NY Hospital Capacity</div>
+            <div style="color:#c3cbdb;font-size:14px;margin-top:2px;">
+                Hospital pressure and bed availability across New York
+            </div>
+        </div>
+        <div style="color:#c3cbdb;font-size:14px;">
+            Data as of {latest_date.strftime('%B %d, %Y')}
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
-statewide_daily["Acute Occupancy %"] = (
-    statewide_daily["occupied_acute"] / statewide_daily["staffed_acute"].replace(0, np.nan) * 100
-)
-statewide_daily["ICU Occupancy %"] = (
-    statewide_daily["occupied_icu"] / statewide_daily["staffed_icu"].replace(0, np.nan) * 100
-)
-statewide_daily["Acute 7-Day Avg"] = statewide_daily["Acute Occupancy %"].rolling(7, min_periods=1).mean()
-statewide_daily["ICU 7-Day Avg"] = statewide_daily["ICU Occupancy %"].rolling(7, min_periods=1).mean()
 
-week_ago_row = statewide_daily[statewide_daily["As of Date"] == latest_date - pd.Timedelta(days=7)]
-acute_week_ago = week_ago_row["Acute Occupancy %"].iloc[0] if not week_ago_row.empty else np.nan
-icu_week_ago = week_ago_row["ICU Occupancy %"].iloc[0] if not week_ago_row.empty else np.nan
+PAGES = ["Overview", "Hospitals", "Trends", "Compare", "About Data"]
 
-nyc_df = df[df["Facility County"].isin(NYC_BOROUGH_MAP)].copy()
-nyc_df["Borough"] = nyc_df["Facility County"].map(NYC_BOROUGH_MAP)
-borough_agg = aggregate_occupancy(nyc_df, "Borough")
-nyc_county_agg = aggregate_occupancy(nyc_df, "Facility County").reset_index()
-nyc_county_agg["Borough"] = nyc_county_agg["Facility County"].map(NYC_BOROUGH_MAP)
+# ---------------------------------------------------------------------------
+# Hospital Detail (drill-down -- not a top-level tab)
+# ---------------------------------------------------------------------------
 
-total_acute_staffed = df["Total Staffed Acute Care Beds"].sum()
-total_acute_occupied = df["Total Staffed Acute Care Beds Occupied"].sum()
-total_acute_available = df["Total Staffed Acute Care Beds Available"].sum()
-state_acute_occupancy = total_acute_occupied / total_acute_staffed * 100
+if st.session_state.detail_pfi is not None:
+    hosp_rows = df[df["Facility PFI"] == st.session_state.detail_pfi]
+    if hosp_rows.empty:
+        st.session_state.detail_pfi = None
+        st.rerun()
+    hosp = hosp_rows.iloc[0]
 
-total_icu_staffed = df["Total Staffed ICU Beds"].sum()
-total_icu_occupied = df["Total Staffed ICU Beds Currently Occupied"].sum()
-total_icu_available = df["Total Staffed ICU Beds Currently Available"].sum()
-state_icu_occupancy = total_icu_occupied / total_icu_staffed * 100
+    if st.button(f"← Back to {st.session_state.return_page}"):
+        st.session_state.detail_pfi = None
+        st.session_state.page = st.session_state.return_page
+        st.rerun()
 
-st.title("New York Hospital Capacity Dashboard")
-st.caption(f"Data as of {latest_date.strftime('%B %d, %Y')} — {len(df)} facilities reporting")
+    bucket = worst_status_bucket(hosp["Acute Occupancy %"], hosp["ICU Occupancy %"])
+    title_col, badge_col = st.columns([4, 1])
+    with title_col:
+        st.markdown(f"### {hosp['Facility Name']}")
+        location = ", ".join(x for x in [hosp["City"] if pd.notna(hosp["City"]) else None, hosp["Facility County"]] if x)
+        st.caption(location)
+    with badge_col:
+        st.markdown(status_badge_html(bucket, uppercase=True, suffix=" CAPACITY"), unsafe_allow_html=True)
 
-TAB_NAMES = [
-    "State Overview",
-    "Hospital Explorer",
-    "Regional Analysis",
-    "Network Analysis",
-    "Priority Dashboard",
-    "NYC Boroughs",
-    "Historical Trends",
-]
-# st.tabs() has no memory of which tab was active, so any widget interaction
-# (e.g. the hospital selectbox) reruns the script and resets it to index 0.
-# A session_state-backed radio persists the selection across reruns instead.
-if "active_tab" not in st.session_state:
-    st.session_state.active_tab = TAB_NAMES[0]
+    hist = history_df[history_df["Facility PFI"] == hosp["Facility PFI"]].sort_values("As of Date")
+    prev_row = hist[hist["As of Date"] == latest_date - pd.Timedelta(days=1)]
+    change = hosp["Acute Occupancy %"] - prev_row["Acute Occupancy %"].iloc[0] if not prev_row.empty else np.nan
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Occupancy", fmt_pct(hosp["Acute Occupancy %"]))
+    k2.metric("Beds free", fmt_int(hosp["Total Staffed Acute Care Beds Available"]))
+    k3.metric("ICU beds free", fmt_int(hosp["Total Staffed ICU Beds Currently Available"]))
+    k4.metric("24h change", f"{change:+.1f} pts" if pd.notna(change) else "N/A")
+    if hosp["Acute Occupancy %"] > 100 or hosp["ICU Occupancy %"] > 100:
+        st.caption(OVER_100_NOTE)
+
+    chart_col, side_col = st.columns([2, 1])
+    with chart_col:
+        st.markdown("#### Capacity trend")
+        hist = hist.copy()
+        hist["Acute 7-Day Avg"] = hist["Acute Occupancy %"].rolling(7, min_periods=1).mean()
+        fig = px.line(hist, x="As of Date", y="Acute Occupancy %")
+        fig.data[0].line.color = "#cde2fb"
+        fig.data[0].line.width = 1
+        fig.add_scatter(x=hist["As of Date"], y=hist["Acute 7-Day Avg"], mode="lines", name="7-Day Avg", line=dict(color=ACCENT, width=2.5))
+        plain_layout(fig, height=320)
+        st.plotly_chart(fig, width="stretch")
+
+    with side_col:
+        st.markdown("#### Bed availability")
+        acute_frac = hosp["Total Staffed Acute Care Beds Occupied"] / hosp["Total Staffed Acute Care Beds"] if hosp["Total Staffed Acute Care Beds"] else 0
+        icu_frac = hosp["Total Staffed ICU Beds Currently Occupied"] / hosp["Total Staffed ICU Beds"] if hosp["Total Staffed ICU Beds"] else 0
+        st.write(f"General beds — {fmt_int(hosp['Total Staffed Acute Care Beds Available'])} / {fmt_int(hosp['Total Staffed Acute Care Beds'])} free")
+        st.progress(min(max(acute_frac, 0), 1))
+        st.write(f"ICU beds — {fmt_int(hosp['Total Staffed ICU Beds Currently Available'])} / {fmt_int(hosp['Total Staffed ICU Beds'])} free")
+        st.progress(min(max(icu_frac, 0), 1))
+        emergency_label = {0: "Low pressure", 1: "Moderate pressure", 2: "High pressure"}.get(bucket, "N/A")
+        st.write(f"Emergency pressure (proxy) — {emergency_label}")
+        st.progress(min(max(acute_frac, 0), 1))
+        st.caption("Derived from acute occupancy -- the dataset does not include emergency-department-specific data.")
+
+    st.markdown("#### Hospital information")
+    address = hosp["Address"] if pd.notna(hosp["Address"]) else "Not on file"
+    info_cols = st.columns(4)
+    info_cols[0].markdown(f"**Address**\n\n{address}")
+    info_cols[1].markdown(f"**Hospital type**\n\n{hosp['Hospital Type']}")
+    info_cols[2].markdown(f"**Network**\n\n{hosp['Facility Network']}")
+    info_cols[3].markdown(f"**Last updated**\n\n{hosp['As of Date'].strftime('%B %d, %Y')}")
+
+    st.stop()
+
+# ---------------------------------------------------------------------------
+# Top navigation
+# ---------------------------------------------------------------------------
 
 st.markdown(
     """
     <style>
-    div[role="radiogroup"] { gap: 4px; border-bottom: 1px solid #e1e0d9; }
+    div[role="radiogroup"] { gap: 4px; border-bottom: 1px solid #e1e0d9; margin-bottom: 1rem; }
     div[role="radiogroup"] label {
-        background: #f9f9f7;
-        border: 1px solid #e1e0d9;
-        border-bottom: none;
-        border-radius: 8px 8px 0 0;
-        padding: 6px 14px;
+        background: #f9f9f7; border-radius: 8px; padding: 6px 16px; margin-bottom: 6px;
     }
-    div[role="radiogroup"] label:has(input:checked) {
-        background: #2a78d6;
-        border-color: #2a78d6;
-    }
-    div[role="radiogroup"] label:has(input:checked) p {
-        color: white !important;
-        font-weight: 600;
-    }
+    div[role="radiogroup"] label:has(input:checked) { background: #e3ebfb; }
+    div[role="radiogroup"] label:has(input:checked) p { color: #2a4fbf !important; font-weight: 700; }
     </style>
     """,
     unsafe_allow_html=True,
 )
-active_tab = st.radio(
-    "Navigation", TAB_NAMES, horizontal=True, label_visibility="collapsed", key="active_tab"
-)
+active_page = st.radio("Navigation", PAGES, horizontal=True, label_visibility="collapsed", key="page")
 
-if active_tab == "State Overview":
-    st.markdown("##### Acute-Care Capacity")
-    acute_col1, acute_col2, acute_col3, acute_col4 = st.columns(4)
-    with acute_col1:
-        kpi_card("Staffed Acute Beds", f"{total_acute_staffed:,.0f}", ACUTE_ACCENT)
-    with acute_col2:
-        kpi_card("Occupied Acute Beds", f"{total_acute_occupied:,.0f}", ACUTE_ACCENT)
-    with acute_col3:
-        kpi_card("Available Acute Beds", f"{total_acute_available:,.0f}", ACUTE_ACCENT)
-    with acute_col4:
-        kpi_badge("Statewide Acute Occupancy", f"{state_acute_occupancy:.1f}%", state_acute_occupancy)
+# ---------------------------------------------------------------------------
+# Overview
+# ---------------------------------------------------------------------------
 
-    st.markdown("##### ICU Capacity")
-    icu_col1, icu_col2, icu_col3, icu_col4 = st.columns(4)
-    with icu_col1:
-        kpi_card("Staffed ICU Beds", f"{total_icu_staffed:,.0f}", ICU_ACCENT)
-    with icu_col2:
-        kpi_card("Occupied ICU Beds", f"{total_icu_occupied:,.0f}", ICU_ACCENT)
-    with icu_col3:
-        kpi_card("Available ICU Beds", f"{total_icu_available:,.0f}", ICU_ACCENT)
-    with icu_col4:
-        kpi_badge("Statewide ICU Occupancy", f"{state_icu_occupancy:.1f}%", state_icu_occupancy)
+if active_page == "Overview":
+    st.markdown("#### Overview dashboard")
+    filtered = filter_bar(df, "ov", "Search hospital...")
 
-    st.subheader("Hospitals Under the Most Capacity Pressure")
-    ranking_cols = [
-        "Facility Name",
-        "Facility County",
-        "DOH Region",
-        "Acute Occupancy %",
-        "ICU Occupancy %",
-        "Total Staffed Acute Care Beds Available",
-        "Total Staffed ICU Beds Currently Available",
-    ]
-    ranked = (
-        df[ranking_cols]
-        .sort_values("Acute Occupancy %", ascending=False)
-        .reset_index(drop=True)
+    buckets = [worst_status_bucket(a, i) for a, i in zip(filtered["Acute Occupancy %"], filtered["ICU Occupancy %"])]
+    avg_occ = metric_snapshot(filtered, "Acute Occupancy %") if len(filtered) else np.nan
+    near_capacity = buckets.count(1)
+    critical = buckets.count(2)
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        kpi_card("Hospitals monitored", f"{len(filtered):,}")
+    with k2:
+        kpi_card("Average occupancy", fmt_pct(avg_occ))
+    with k3:
+        kpi_card("Near capacity", f"{near_capacity}", bucket=1)
+    with k4:
+        kpi_card("Critical", f"{critical}", bucket=2)
+
+    map_col, side_col = st.columns([2, 1])
+    with map_col:
+        header_col, toggle_col = st.columns([2, 2])
+        with header_col:
+            st.markdown("##### Interactive New York map")
+        with toggle_col:
+            map_view = st.segmented_control(
+                "Map view", ["Markers", "3D", "Choropleth"], default="Markers", key="ov_map_view", label_visibility="collapsed"
+            ) or "Markers"
+        if map_view == "3D":
+            render_3d_map(filtered)
+        elif map_view == "Choropleth":
+            render_choropleth_map(filtered)
+        else:
+            render_marker_map(filtered, key="overview_map")
+
+    with side_col:
+        st.markdown("##### Capacity status")
+        for b in (2, 1, 0):
+            count = buckets.count(b)
+            range_text = {0: f"< {STATUS_THRESHOLDS[0]}%", 1: f"{STATUS_THRESHOLDS[0]}–{STATUS_THRESHOLDS[1]}%", 2: f"> {STATUS_THRESHOLDS[1]}%"}[b]
+            st.markdown(
+                f"""
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
+                    <div style="width:14px;height:14px;border-radius:50%;background:{STATUS_MAP_COLORS[b]};"></div>
+                    <div><b>{count} {STATUS_LABELS[b]}</b><br/><span style="color:#787670;font-size:12px;">{range_text}</span></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        st.markdown("**Highest pressure**")
+        top5 = filtered.sort_values("Acute Occupancy %", ascending=False).head(5)
+        for i, (_, row) in enumerate(top5.iterrows(), start=1):
+            st.write(f"{i}. {row['Facility Name']} — {fmt_pct(row['Acute Occupancy %'])}")
+
+    st.caption("Pressure colors are illustrative analytical thresholds, not medical or regulatory standards. " + OVER_100_NOTE)
+
+# ---------------------------------------------------------------------------
+# Hospitals
+# ---------------------------------------------------------------------------
+
+elif active_page == "Hospitals":
+    st.markdown("#### Hospitals")
+    filtered = filter_bar(df, "hosp", "Search by hospital or borough...")
+    render_hospital_table(filtered, key="hospitals_table")
+    st.caption("Pressure colors are illustrative analytical thresholds, not medical or regulatory standards. " + OVER_100_NOTE)
+
+# ---------------------------------------------------------------------------
+# Trends
+# ---------------------------------------------------------------------------
+
+elif active_page == "Trends":
+    st.markdown("#### Capacity trends")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        range_label = st.selectbox("Date range", ["Last 7 days", "Last 30 days", "Last 90 days", "All time"], index=1)
+    with c2:
+        region_label = st.selectbox("Region", ["All NY"] + sorted(df["Region"].unique()))
+    with c3:
+        metric = st.selectbox("Metric", list(METRICS.keys()))
+
+    days = {"Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90, "All time": None}[range_label]
+    range_start = history_df["As of Date"].min() if days is None else latest_date - pd.Timedelta(days=days)
+
+    hist = history_df[history_df["As of Date"] >= range_start]
+    if region_label != "All NY":
+        hist = hist[hist["Region"] == region_label]
+    snapshot = df if region_label == "All NY" else df[df["Region"] == region_label]
+
+    chart_col, side_col = st.columns([2, 1])
+    with chart_col:
+        st.markdown("##### " + metric + " over time")
+        series = metric_timeseries(hist, metric)
+        fig = px.line(series, x="As of Date", y=metric, markers=len(series) <= 40)
+        fig.data[0].line.color = ACCENT
+        plain_layout(fig, height=360)
+        st.plotly_chart(fig, width="stretch")
+
+    with side_col:
+        st.markdown("##### By region")
+        by_region = metric_snapshot(df, metric, group_col="Region").sort_values(ascending=False)
+        fmt = fmt_pct if METRICS[metric]["kind"] == "pct" else fmt_int
+        for region, value in by_region.items():
+            st.write(f"{region} — **{fmt(value)}**")
+
+        st.markdown("##### Key change")
+        start_val = series[metric].iloc[0] if len(series) else np.nan
+        end_val = series[metric].iloc[-1] if len(series) else np.nan
+        delta = end_val - start_val if pd.notna(start_val) and pd.notna(end_val) else np.nan
+        unit = "pts" if METRICS[metric]["kind"] == "pct" else "beds"
+        st.markdown(f"### {delta:+.1f} {unit}" if pd.notna(delta) else "### N/A")
+        st.caption(f"{metric} vs. start of range ({range_label.lower()})")
+
+    st.markdown("##### Hospital comparison")
+    top_n = snapshot.sort_values("Acute Occupancy %", ascending=False).head(8).sort_values("Acute Occupancy %")
+    fig_bar = px.bar(
+        top_n, x="Acute Occupancy %", y="Facility Name", orientation="h",
+        text=top_n["Acute Occupancy %"].round(1).astype(str) + "%",
     )
-    st.dataframe(
-        ranked.style.format({"Acute Occupancy %": "{:.1f}", "ICU Occupancy %": "{:.1f}"}).map(
-            pressure_style, subset=["Acute Occupancy %", "ICU Occupancy %"]
-        ),
-        use_container_width=True,
-    )
-    st.caption(
-        "Pressure colors are illustrative analytical thresholds (75% / 85% / 95%), "
-        "not medical or regulatory standards. " + OVER_100_NOTE
-    )
+    fig_bar.update_traces(marker_color=ACCENT, textposition="outside", cliponaxis=False)
+    plain_layout(fig_bar, height=max(260, 32 * len(top_n)))
+    fig_bar.update_layout(yaxis=dict(title=None), xaxis=dict(title="Acute Occupancy %"))
+    st.plotly_chart(fig_bar, width="stretch")
+    st.caption("Top 8 hospitals by acute occupancy" + (f" in {region_label}" if region_label != "All NY" else " statewide") + " on the latest reporting date.")
 
-    with st.expander("Raw data preview"):
-        st.dataframe(df.head(20), use_container_width=True)
+# ---------------------------------------------------------------------------
+# Compare
+# ---------------------------------------------------------------------------
 
-elif active_tab == "Hospital Explorer":
-    hospital_name = st.selectbox("Select Hospital", sorted(df["Facility Name"].unique()))
-    hosp = df[df["Facility Name"] == hospital_name].iloc[0]
+elif active_page == "Compare":
+    st.markdown("#### Compare hospitals")
+    st.caption("Select 2 to 4 hospitals to compare occupancy, availability, and recent trends side by side.")
+    selected = st.multiselect("Select hospitals", sorted(df["Facility Name"].unique()), max_selections=4)
 
-    st.markdown(
-        f"**County:** {hosp['Facility County']}  |  "
-        f"**DOH Region:** {hosp['DOH Region']}  |  "
-        f"**Network:** {hosp['Facility Network']}"
-    )
-    st.caption(f"Reporting date: {hosp['As of Date'].strftime('%B %d, %Y')}")
-
-    st.markdown("#### Acute-Care Beds")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Staffed", f"{hosp['Total Staffed Acute Care Beds']:,.0f}")
-    c2.metric("Occupied", f"{hosp['Total Staffed Acute Care Beds Occupied']:,.0f}")
-    c3.metric("Available", f"{hosp['Total Staffed Acute Care Beds Available']:,.0f}")
-    c4.metric("Occupancy", fmt_pct(hosp["Acute Occupancy %"]))
-
-    st.markdown("#### ICU Beds")
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Staffed", f"{hosp['Total Staffed ICU Beds']:,.0f}")
-    c6.metric("Occupied", f"{hosp['Total Staffed ICU Beds Currently Occupied']:,.0f}")
-    c7.metric("Available", f"{hosp['Total Staffed ICU Beds Currently Available']:,.0f}")
-    c8.metric("Occupancy", fmt_pct(hosp["ICU Occupancy %"]))
-
-    if hosp["Acute Occupancy %"] > 100 or hosp["ICU Occupancy %"] > 100:
-        st.caption(OVER_100_NOTE)
-
-    st.markdown("#### Acute Occupancy in Context")
-    region_occ = region_agg.loc[hosp["DOH Region"], "Acute Occupancy %"]
-    network_occ = network_agg.loc[hosp["Facility Network"], "Acute Occupancy %"]
-    ctx1, ctx2, ctx3 = st.columns(3)
-    ctx1.metric("This Hospital", fmt_pct(hosp["Acute Occupancy %"]))
-    ctx2.metric(f"{hosp['DOH Region']} Region", fmt_pct(region_occ))
-    ctx3.metric("Statewide", fmt_pct(state_acute_occupancy))
-    st.caption(f"Network ({hosp['Facility Network']}) acute occupancy: {fmt_pct(network_occ)}")
-
-elif active_tab == "Regional Analysis":
-    region_table = region_agg.reset_index().sort_values("Acute Occupancy %", ascending=True)
-
-    fig = px.bar(
-        region_table,
-        x="Acute Occupancy %",
-        y="DOH Region",
-        orientation="h",
-        text=region_table["Acute Occupancy %"].round(1).astype(str) + "%",
-    )
-    fig.update_traces(marker_color="#2a78d6", textposition="outside", cliponaxis=False)
-    fig.update_layout(
-        plot_bgcolor="#fcfcfb",
-        paper_bgcolor="#fcfcfb",
-        font_color="#0b0b0b",
-        xaxis=dict(title="Acute Occupancy %", gridcolor="#e1e0d9", zeroline=False),
-        yaxis=dict(title=None, gridcolor="#e1e0d9"),
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=max(320, 32 * len(region_table)),
-    )
-    st.subheader("Acute-Care Occupancy by DOH Region")
-    st.plotly_chart(fig, use_container_width=True)
-
-    st.subheader("Region Comparison Table")
-    region_display = region_table.rename(
-        columns={
-            "DOH Region": "DOH Region",
-            "facility_count": "Hospitals",
-            "staffed_acute": "Staffed Acute Beds",
-            "occupied_acute": "Occupied Acute Beds",
-            "available_acute": "Available Acute Beds",
-            "staffed_icu": "Staffed ICU Beds",
-            "occupied_icu": "Occupied ICU Beds",
-            "available_icu": "Available ICU Beds",
-        }
-    ).sort_values("Acute Occupancy %", ascending=False)
-    st.dataframe(
-        region_display.style.format(
-            {"Acute Occupancy %": "{:.1f}", "ICU Occupancy %": "{:.1f}"}
-        ).map(pressure_style, subset=["Acute Occupancy %", "ICU Occupancy %"]),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.caption(
-        "Pressure colors are illustrative analytical thresholds (75% / 85% / 95%), "
-        "not medical or regulatory standards. " + OVER_100_NOTE
-    )
-
-elif active_tab == "Network Analysis":
-    network_names = sorted(network_agg.index)
-    selected_network = st.selectbox("Select Hospital Network", network_names)
-    net_row = network_agg.loc[selected_network]
-
-    st.markdown(f"#### {selected_network}")
-    n1, n2, n3, n4 = st.columns(4)
-    n1.metric("Hospitals in Network", f"{net_row['facility_count']:,.0f}")
-    n2.metric("Staffed Acute Beds", f"{net_row['staffed_acute']:,.0f}")
-    n3.metric("Available Acute Beds", f"{net_row['available_acute']:,.0f}")
-    n4.metric("Network Acute Occupancy", fmt_pct(net_row["Acute Occupancy %"]))
-
-    n5, n6, n7, n8 = st.columns(4)
-    n5.metric("Staffed ICU Beds", f"{net_row['staffed_icu']:,.0f}")
-    n6.metric("Available ICU Beds", f"{net_row['available_icu']:,.0f}")
-    n7.metric("Network ICU Occupancy", fmt_pct(net_row["ICU Occupancy %"]))
-    n8.metric("Statewide Acute Occupancy", fmt_pct(state_acute_occupancy))
-
-    st.subheader(f"Hospitals in {selected_network}")
-    network_hospitals_cols = [
-        "Facility Name",
-        "Facility County",
-        "DOH Region",
-        "Acute Occupancy %",
-        "ICU Occupancy %",
-        "Total Staffed Acute Care Beds Available",
-        "Total Staffed ICU Beds Currently Available",
-    ]
-    network_hospitals = (
-        df[df["Facility Network"] == selected_network][network_hospitals_cols]
-        .sort_values("Acute Occupancy %", ascending=False)
-        .reset_index(drop=True)
-    )
-    st.dataframe(
-        network_hospitals.style.format(
-            {"Acute Occupancy %": "{:.1f}", "ICU Occupancy %": "{:.1f}"}
-        ).map(pressure_style, subset=["Acute Occupancy %", "ICU Occupancy %"]),
-        use_container_width=True,
-    )
-    st.caption(
-        "Helps distinguish whether capacity pressure is isolated to one hospital "
-        "or affecting the whole network. Pressure colors are illustrative analytical "
-        "thresholds (75% / 85% / 95%), not medical or regulatory standards. " + OVER_100_NOTE
-    )
-
-elif active_tab == "Priority Dashboard":
-    st.caption(
-        "Ranks every hospital by whichever is worse -- acute or ICU occupancy -- so a "
-        "hospital that's fine on acute beds but critical on ICU still surfaces. "
-        "Priority labels are illustrative analytical thresholds (75% / 85% / 95%), "
-        "not medical or regulatory standards. " + OVER_100_NOTE
-    )
-
-    st.subheader("Statewide Acute-Care Occupancy by County")
-    county_plot_df = county_agg.reset_index()
-    st.plotly_chart(
-        county_choropleth(county_plot_df, "Facility County"),
-        use_container_width=True,
-    )
-
-    st.subheader("Hospital Capacity — 3D Map (Statewide)")
-    state_map_date = weekly_slider(history_df, latest_date, key="state_map_week")
-    st.caption(f"Week of {state_map_date.strftime('%B %d, %Y')}")
-
-    day_state = history_df[history_df["As of Date"] == state_map_date].copy()
-
-    render_hospital_3d_map(
-        day_state,
-        pdk.ViewState(latitude=42.9, longitude=-75.5, zoom=6, pitch=45, bearing=0),
-        subtitle_col="Facility County",
-        region_label="New York State",
-        radius=1500,
-        elevation_scale=200,
-    )
-
-    st.subheader("Hospital Priority Ranking")
-    priority_cols = [
-        "Facility Name",
-        "Facility County",
-        "DOH Region",
-        "Facility Network",
-        "Acute Occupancy %",
-        "ICU Occupancy %",
-        "Total Staffed Acute Care Beds Available",
-        "Total Staffed ICU Beds Currently Available",
-    ]
-    priority_df = df[priority_cols].copy()
-    priority_df["Priority Bucket"] = [
-        priority_bucket(a, i)
-        for a, i in zip(priority_df["Acute Occupancy %"], priority_df["ICU Occupancy %"])
-    ]
-    priority_df["Priority"] = priority_df["Priority Bucket"].apply(priority_label)
-    priority_df = priority_df.sort_values(
-        ["Priority Bucket", "Acute Occupancy %"], ascending=[False, False]
-    ).drop(columns="Priority Bucket").reset_index(drop=True)
-    priority_df = priority_df[
-        ["Priority"] + [c for c in priority_df.columns if c != "Priority"]
-    ]
-
-    st.dataframe(
-        priority_df.style.format(
-            {"Acute Occupancy %": "{:.1f}", "ICU Occupancy %": "{:.1f}"}
-        ).map(
-            pressure_style, subset=["Acute Occupancy %", "ICU Occupancy %"]
-        ).apply(priority_row_style, axis=1),
-        use_container_width=True,
-    )
-
-elif active_tab == "NYC Boroughs":
-    st.caption(
-        f"{nyc_df['Facility PFI'].nunique()} facilities across the five NYC boroughs "
-        f"(Manhattan, Brooklyn, Bronx, Queens, Staten Island)."
-    )
-
-    st.subheader("Acute-Care Occupancy Map")
-    st.plotly_chart(
-        county_choropleth(nyc_county_agg, "Facility County", hover_name_col="Borough"),
-        use_container_width=True,
-    )
-
-    borough_table = borough_agg.reset_index().sort_values("Acute Occupancy %", ascending=True)
-
-    fig_nyc = px.bar(
-        borough_table,
-        x="Acute Occupancy %",
-        y="Borough",
-        orientation="h",
-        text=borough_table["Acute Occupancy %"].round(1).astype(str) + "%",
-    )
-    fig_nyc.update_traces(marker_color=ACUTE_ACCENT, textposition="outside", cliponaxis=False)
-    fig_nyc.update_layout(
-        plot_bgcolor="#fcfcfb",
-        paper_bgcolor="#fcfcfb",
-        font_color="#0b0b0b",
-        xaxis=dict(title="Acute Occupancy %", gridcolor="#e1e0d9", zeroline=False),
-        yaxis=dict(title=None, gridcolor="#e1e0d9"),
-        margin=dict(l=10, r=10, t=10, b=10),
-        height=max(280, 40 * len(borough_table)),
-    )
-    st.subheader("Acute-Care Occupancy by Borough")
-    st.plotly_chart(fig_nyc, use_container_width=True)
-
-    st.subheader("Borough Comparison Table")
-    borough_display = borough_table.rename(
-        columns={
-            "facility_count": "Hospitals",
-            "staffed_acute": "Staffed Acute Beds",
-            "occupied_acute": "Occupied Acute Beds",
-            "available_acute": "Available Acute Beds",
-            "staffed_icu": "Staffed ICU Beds",
-            "occupied_icu": "Occupied ICU Beds",
-            "available_icu": "Available ICU Beds",
-        }
-    ).sort_values("Acute Occupancy %", ascending=False)
-    st.dataframe(
-        borough_display.style.format(
-            {"Acute Occupancy %": "{:.1f}", "ICU Occupancy %": "{:.1f}"}
-        ).map(pressure_style, subset=["Acute Occupancy %", "ICU Occupancy %"]),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.caption(
-        "Pressure colors are illustrative analytical thresholds (75% / 85% / 95%), "
-        "not medical or regulatory standards. " + OVER_100_NOTE
-    )
-
-    st.subheader("Hospitals in Selected Borough")
-    selected_borough = st.selectbox("Select Borough", sorted(borough_agg.index))
-    borough_hospitals_cols = [
-        "Facility Name",
-        "Facility County",
-        "Facility Network",
-        "Acute Occupancy %",
-        "ICU Occupancy %",
-        "Total Staffed Acute Care Beds Available",
-        "Total Staffed ICU Beds Currently Available",
-    ]
-    borough_hospitals = (
-        nyc_df[nyc_df["Borough"] == selected_borough][borough_hospitals_cols]
-        .sort_values("Acute Occupancy %", ascending=False)
-        .reset_index(drop=True)
-    )
-    st.dataframe(
-        borough_hospitals.style.format(
-            {"Acute Occupancy %": "{:.1f}", "ICU Occupancy %": "{:.1f}"}
-        ).map(pressure_style, subset=["Acute Occupancy %", "ICU Occupancy %"]),
-        use_container_width=True,
-    )
-
-    st.subheader("Hospital Capacity — 3D Map")
-    nyc_map_date = weekly_slider(history_df, latest_date, key="nyc_map_week")
-    st.caption(f"Week of {nyc_map_date.strftime('%B %d, %Y')}")
-
-    day_nyc = history_df[
-        (history_df["As of Date"] == nyc_map_date)
-        & (history_df["Facility County"].isin(NYC_BOROUGH_MAP))
-    ].copy()
-    day_nyc["Borough"] = day_nyc["Facility County"].map(NYC_BOROUGH_MAP)
-
-    render_hospital_3d_map(
-        day_nyc,
-        pdk.ViewState(latitude=40.72, longitude=-73.95, zoom=9.8, pitch=45, bearing=0),
-        subtitle_col="Borough",
-        region_label="NYC",
-        radius=120,
-        elevation_scale=60,
-    )
-
-elif active_tab == "Historical Trends":
-    st.caption(
-        f"Full reporting history: {history_df['As of Date'].min().strftime('%B %d, %Y')} "
-        f"to {latest_date.strftime('%B %d, %Y')} "
-        f"({history_df['As of Date'].nunique()} days)."
-    )
-
-    st.subheader("Statewide Occupancy Trend")
-    trend_col1, trend_col2 = st.columns(2)
-    with trend_col1:
-        acute_delta = state_acute_occupancy - acute_week_ago if pd.notna(acute_week_ago) else None
-        st.metric(
-            "Acute Occupancy (vs. 7 days ago)",
-            f"{state_acute_occupancy:.1f}%",
-            delta=f"{acute_delta:+.1f} pts" if acute_delta is not None else None,
-            delta_color="inverse",
+    if len(selected) < 2:
+        st.info("Select at least 2 hospitals to compare.")
+    else:
+        rows = df[df["Facility Name"].isin(selected)].copy()
+        rows["Status"] = [status_label(worst_status_bucket(a, i)) for a, i in zip(rows["Acute Occupancy %"], rows["ICU Occupancy %"])]
+        display = rows[
+            ["Facility Name", "Region", "Acute Occupancy %", "ICU Occupancy %", "Total Staffed Acute Care Beds Available", "Total Staffed ICU Beds Currently Available", "Status"]
+        ].rename(
+            columns={
+                "Facility Name": "Hospital",
+                "Total Staffed Acute Care Beds Available": "Beds free",
+                "Total Staffed ICU Beds Currently Available": "ICU free",
+            }
         )
-    with trend_col2:
-        icu_delta = state_icu_occupancy - icu_week_ago if pd.notna(icu_week_ago) else None
-        st.metric(
-            "ICU Occupancy (vs. 7 days ago)",
-            f"{state_icu_occupancy:.1f}%",
-            delta=f"{icu_delta:+.1f} pts" if icu_delta is not None else None,
-            delta_color="inverse",
+        st.dataframe(
+            display.style.format({"Acute Occupancy %": "{:.1f}%", "ICU Occupancy %": "{:.1f}%"}).map(status_cell_style, subset=["Status"]),
+            width="stretch",
+            hide_index=True,
         )
 
-    fig_trend = px.line(statewide_daily, x="As of Date", y=["Acute 7-Day Avg", "ICU 7-Day Avg"])
-    trend_colors = {"Acute 7-Day Avg": ACUTE_ACCENT, "ICU 7-Day Avg": ICU_ACCENT}
-    for trace in fig_trend.data:
-        trace.line.color = trend_colors[trace.name]
-        trace.name = trace.name.replace(" 7-Day Avg", "")
-    fig_trend.update_layout(
-        plot_bgcolor="#fcfcfb",
-        paper_bgcolor="#fcfcfb",
-        font_color="#0b0b0b",
-        xaxis=dict(title=None, gridcolor="#e1e0d9"),
-        yaxis=dict(title="Occupancy % (7-day avg)", gridcolor="#e1e0d9", zeroline=False),
-        legend_title_text="",
-        margin=dict(l=10, r=10, t=10, b=10),
-    )
-    st.plotly_chart(fig_trend, use_container_width=True)
-    st.caption(
-        "Statewide acute and ICU occupancy, smoothed with a 7-day rolling average "
-        "to remove day-to-day reporting noise."
-    )
+        st.markdown("##### Acute occupancy trend")
+        pfis = rows["Facility PFI"].tolist()
+        hist = history_df[history_df["Facility PFI"].isin(pfis)]
+        fig = px.line(hist, x="As of Date", y="Acute Occupancy %", color="Facility Name")
+        plain_layout(fig, height=360)
+        st.plotly_chart(fig, width="stretch")
 
-    st.subheader("Hospital Trend")
-    # Facility Name text isn't stable over time (formatting changes, real
-    # renames) but Facility PFI is, so build the selector from the latest
-    # snapshot's clean PFI-to-name mapping and filter history by PFI --
-    # matching by name would silently truncate the trend for ~76 hospitals
-    # whose name string changed partway through the 340-day history.
-    trend_hospital_options = sorted(zip(df["Facility Name"], df["Facility PFI"]))
-    trend_hospital = st.selectbox(
-        "Select Hospital",
-        [name for name, _ in trend_hospital_options],
-        key="trend_hospital",
-    )
-    trend_pfi = dict(trend_hospital_options)[trend_hospital]
-    hosp_history = (
-        history_df[history_df["Facility PFI"] == trend_pfi]
-        .sort_values("As of Date")
-        .copy()
-    )
-    hosp_history["Acute 7-Day Avg"] = hosp_history["Acute Occupancy %"].rolling(7, min_periods=1).mean()
+# ---------------------------------------------------------------------------
+# About Data
+# ---------------------------------------------------------------------------
 
-    fig_hosp = px.line(hosp_history, x="As of Date", y="Acute Occupancy %")
-    fig_hosp.data[0].line.color = "#cde2fb"
-    fig_hosp.data[0].line.width = 1
-    fig_hosp.data[0].name = "Daily"
-    fig_hosp.data[0].showlegend = True
-    fig_hosp.add_scatter(
-        x=hosp_history["As of Date"],
-        y=hosp_history["Acute 7-Day Avg"],
-        mode="lines",
-        name="7-Day Avg",
-        line=dict(color=ACUTE_ACCENT, width=2.5),
-    )
-    fig_hosp.update_layout(
-        plot_bgcolor="#fcfcfb",
-        paper_bgcolor="#fcfcfb",
-        font_color="#0b0b0b",
-        xaxis=dict(title=None, gridcolor="#e1e0d9"),
-        yaxis=dict(title="Acute Occupancy %", gridcolor="#e1e0d9", zeroline=False),
-        legend_title_text="",
-        margin=dict(l=10, r=10, t=10, b=10),
-    )
-    st.plotly_chart(fig_hosp, use_container_width=True)
-    caption_text = f"Daily acute occupancy for {trend_hospital}, with a 7-day rolling average overlaid."
-    if (hosp_history["Acute Occupancy %"] > 100).any():
-        caption_text += " " + OVER_100_NOTE
-    st.caption(caption_text)
+elif active_page == "About Data":
+    st.markdown("#### About the data")
+    left, right = st.columns([2, 1])
+
+    with left:
+        st.markdown("**Data source**")
+        st.write(f"New York State Statewide Hospital Bed Capacity, published by the NY State Department of Health. [View the original dataset]({SOURCE_URL}).")
+        st.divider()
+        st.markdown("**Update frequency**")
+        st.write(
+            f"This app loads a downloaded snapshot of the dataset covering {history_df['As of Date'].nunique()} daily "
+            f"reporting dates, from {history_df['As of Date'].min().strftime('%B %d, %Y')} to {latest_date.strftime('%B %d, %Y')}. "
+            "The app does not fetch live data; refreshing it requires downloading a new export."
+        )
+        st.divider()
+        st.markdown("**Definitions**")
+        st.write(
+            "- **Acute occupancy %** = occupied staffed acute-care beds ÷ total staffed acute-care beds.\n"
+            "- **ICU occupancy %** = occupied staffed ICU beds ÷ total staffed ICU beds.\n"
+            "- **Beds free / ICU free** = staffed beds currently available, as self-reported by each facility."
+        )
+        st.divider()
+        st.markdown("**Methodology**")
+        st.write(
+            "Regional, network, and statewide occupancy figures are weighted (total occupied beds ÷ total staffed beds "
+            "across the group), not an average of individual hospitals' percentages -- this avoids overweighting small "
+            "facilities relative to large ones. A hospital's overall status badge reflects whichever of acute or ICU "
+            "occupancy is worse, so a hospital fine on acute beds but critical on ICU still surfaces."
+        )
+        st.divider()
+        st.markdown("**Limitations**")
+        st.write(
+            "The dataset does not include staffing levels, patient acuity, specialty availability, hospital finances, "
+            "or transfer feasibility. Reported capacity may lag real-time operational conditions, and a handful of "
+            "hospitals report occupancy above 100% (see the note on the Overview and Hospitals pages). This app "
+            "identifies where capacity pressure exists; it does not diagnose the cause or prescribe a specific "
+            "intervention."
+        )
+
+    with right:
+        st.markdown("##### Capacity definitions")
+        for b in (0, 1, 2):
+            range_text = {0: f"< {STATUS_THRESHOLDS[0]}%", 1: f"{STATUS_THRESHOLDS[0]}–{STATUS_THRESHOLDS[1]}%", 2: f"> {STATUS_THRESHOLDS[1]}%"}[b]
+            st.markdown(
+                f"""
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    {status_badge_html(b)}
+                    <span style="color:#52514e;">{range_text}</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        st.caption("Analytical/app thresholds only -- not medical or regulatory standards.")
+
+        st.markdown("##### Data freshness")
+        st.markdown(f"**{latest_date.strftime('%B %d, %Y')}**")
+        st.caption("Reported capacity may change between updates and does not reflect real-time operational conditions.")

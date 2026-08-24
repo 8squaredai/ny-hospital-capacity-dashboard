@@ -1,0 +1,44 @@
+name: Update hospital capacity data
+
+on:
+  schedule:
+    # 14:30 New York time -- run at both UTC offsets (EDT/EST) since GitHub
+    # Actions cron is UTC-only and can't shift for daylight saving. The
+    # script only commits when the data actually changed, so whichever run
+    # lands outside the current offset is a harmless no-op.
+    - cron: "30 18 * * *" # 14:30 EDT (UTC-4)
+    - cron: "30 19 * * *" # 14:30 EST (UTC-5)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  update-data:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Fetch latest hospital capacity data
+        env:
+          SOCRATA_APP_TOKEN: ${{ secrets.SOCRATA_APP_TOKEN }}
+        run: python scripts/update_data.py
+
+      - name: Commit and push if data changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/hospital_history.csv
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Daily data refresh: $(date -u +%Y-%m-%d)"
+            git push
+          fi

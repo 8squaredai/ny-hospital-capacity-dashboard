@@ -288,6 +288,88 @@ commit is needed whenever the push is resumed.
 
 ---
 
+## 10. Teacher-feedback redesign: 7-tab dashboard → 4-tab decision flow
+
+**Initial approach:** seven flat tabs (State Overview, Hospital Explorer,
+Regional Analysis, Network Analysis, Priority Dashboard, NYC Boroughs,
+Historical Trends), each a self-contained analysis view with no shared
+navigation model.
+
+**Pivot:** the course instructor reviewed the app and supplied a wireframe
+spec (five reference screens + layout notes) built around a different
+design principle — "users should be able to see system pressure first,
+locate the problem second, and investigate a specific hospital third."
+Rebuilt around that: four top-level tabs (Overview, Hospitals, Trends,
+About Data), a Hospital Detail screen reached by drilling in from the map
+or the Hospitals table rather than being its own tab, and an optional
+fifth Compare tab (explicitly suggested in the brief as a stretch feature).
+
+**What had no direct home in the new design, and what happened to it:**
+- **Network Analysis** as a dedicated tab was dropped — the wireframes
+  have no network-specific screen. `Facility Network` survives as a filter
+  option and as a field on the Hospital Detail info panel, so the data
+  isn't lost, just no longer a top-level view.
+- **NYC Boroughs** as a dedicated tab was dropped — borough-level
+  filtering is still possible via the Region filter (`New York City`) and
+  by typing a borough name into search (kept the `NYC_BOROUGH_MAP` alias
+  so "Brooklyn" still matches `Facility County == KINGS`), but there's no
+  longer a boroughs-only page.
+- **The pydeck 3D column maps and the county choropleth** were replaced
+  with a single 2D Plotly scatter map (`px.scatter_map`, OpenStreetMap
+  tiles, no token needed) with clickable, color-coded hospital markers —
+  matching the wireframe's plain dot-marker map, not the earlier 3D-bar
+  visual. This also let `pydeck` and the county GeoJSON drop out of the
+  dependency chain entirely.
+- **The 4-tier pressure system (Low/Moderate/High/Critical at
+  75/85/95%)** was collapsed to the 3-tier system the new "About Data"
+  page explicitly documents (Available / High occupancy / Critical at
+  75/90%), since shipping an About page that documents different
+  thresholds than the rest of the app actually uses would be a real
+  inconsistency, not just a visual one.
+
+**Drill-down mechanics:** Streamlit has no native routing, so "open a
+hospital's detail page by clicking a map marker or a table row" is built
+on `st.session_state.detail_pfi` — when set, the whole page short-circuits
+into the detail view via `st.stop()` before the tab router ever runs, with
+a "← Back to {previous tab}" button restoring `st.session_state.page`.
+Click capture uses `st.plotly_chart(..., on_select="rerun")` for the map
+and `st.dataframe(..., on_select="rerun", selection_mode="single-row")`
+for the table — both added to Streamlit in the 1.35+ line, comfortably
+inside this project's `streamlit>=1.48` floor.
+
+**Verification:** per the section-5 pivot (no browser automation), tested
+via Streamlit's `AppTest` harness instead — runs the real script headlessly
+without a browser, letting every tab, filter, the Compare multiselect, and
+the detail-view drill-down (including the back button and an over-100%-
+occupancy edge case) be exercised for exceptions directly from the
+terminal.
+
+**Addendum — the 3D map and choropleth came back, as a toggle:** the user
+asked directly why the 3D map was gone, and wanted to switch between the
+3D view and a county choropleth. Rather than re-litigating which single
+map to keep, added an `st.segmented_control` toggle above the Overview map
+(Markers / 3D / Choropleth) so all three coexist: Markers stays the
+default and the only one with click-to-drill-down (pydeck has no native
+click-to-select in Streamlit the way Plotly does, and a county choropleth
+can't identify one hospital anyway), 3D restores the original pydeck
+`ColumnLayer` with its already-tuned `radius=1500`/`elevation_scale=200`
+from section 6, and Choropleth restores the original county-level
+`px.choropleth` + `ny_counties.geojson`. `pydeck` went back into
+`requirements.txt`.
+
+One AppTest-only wrinkle worth remembering if this project's test scripts
+are extended later: `st.segmented_control(..., default="Markers")`
+serializes its default as a bare string, and `AppTest`'s widget-state
+re-serialization on every subsequent `.run()` crashes trying to iterate
+that string character-by-character (`"3"` not in list, `"M"` not in
+list). Not a real app bug -- the live frontend stores the same value fine
+-- but any test driving this app through `AppTest` needs to normalize
+`at.session_state["ov_map_view"]` to a list (e.g. `["Markers"]`) once
+after the first `.run()`, or use `at.segmented_control[0].set_value(...)`
+where the API version supports it.
+
+---
+
 ## Quick-reference table
 
 | # | Started with | Ended with | Why it changed |
@@ -306,3 +388,4 @@ commit is needed whenever the push is resumed.
 | 6 | `radius=4000`, `elevation_scale=40` | `radius=1500`, `elevation_scale=200` | Visual check: bars were "low and wide" |
 | 7 | Name-matched hospital trend selector | PFI-matched selector | Name text changes mid-history truncated 76 hospitals' trend lines |
 | 9 | Push to GitHub now | Paused | Live GitHub API outage, user said wait |
+| 10 | 7-tab flat dashboard | 4-tab + drill-down + Compare | Teacher wireframe spec: pressure first, problem second, hospital third |
