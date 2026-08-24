@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import html
 import json
+from typing import Literal, Optional
 
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import pydeck as pdk
 import streamlit as st
+from google import genai
+from google.genai import types as genai_types
+from pydantic import BaseModel
 
 st.set_page_config(page_title="NY Hospital Capacity", layout="wide")
 
@@ -53,14 +58,23 @@ STATUS_COLORS = {
 }
 STATUS_MAP_COLORS = {0: "#2fa84f", 1: "#e0a52c", 2: "#d1453b"}
 
-# A few hospitals report occupancy over 100% -- verified against the source data, not a
-# calculation bug (Occupied + Available == Staffed holds exactly). Causes vary by facility:
-# patient boarding beyond the staffed bed count, short-notice staffing reductions, or a
-# "staffed beds" figure that's stale or narrower in definition than "occupied".
+# Verified directly against the source data (2026-08-24): 833 of 73,524 acute rows (~1.1%)
+# and 1,080 (~1.5%) of ICU rows exceed 100% occupancy. In effectively all of them (all but 4
+# rows total) Beds Free = Staffed - Occupied holds exactly, so a negative "beds free" number
+# is the algebraic mirror of the same >100% occupancy, not a separate bug. Causes vary by
+# facility: patient boarding beyond the staffed bed count, short-notice staffing reductions
+# that shrink the staffed baseline, or a "staffed beds" figure that's stale or narrower in
+# definition than "occupied". It isn't always a one-off blip either -- a few small facilities
+# (e.g. Lockport Memorial Hospital) report this on nearly every single day in the dataset,
+# suggesting a persistent reporting-definition mismatch for that facility rather than a
+# transient surge.
 OVER_100_NOTE = (
-    "Occupancy can exceed 100% for some hospitals -- this reflects patient boarding, "
-    "short-notice staffing reductions, or inconsistencies in self-reported facility "
-    "data, not a calculation error."
+    "Occupancy above 100% (and a negative \"beds free\" number, which is the same thing "
+    "expressed as a bed count) means more patients are occupying beds than the hospital "
+    "has marked as staffed. This reflects patient boarding, short-notice staffing "
+    "reductions, or a stale/narrower staffed-bed count -- not a calculation error. For a "
+    "few small facilities this is a near-daily, persistent pattern rather than a one-off "
+    "spike."
 )
 
 METRICS = {
@@ -158,6 +172,21 @@ def status_label(bucket: int | None) -> str:
     return STATUS_LABELS[int(bucket)]
 
 
+def occupancy_column_config() -> dict:
+    """Hover-tooltip column config for any table showing occupancy % or beds-free counts --
+    covers every column name used across the different tables; Streamlit ignores entries
+    for columns that aren't actually present in a given table, so one shared dict is safe
+    to reuse everywhere instead of repeating it per call site."""
+    tip = st.column_config.NumberColumn(help=OVER_100_NOTE)
+    return {
+        "Occupancy": tip,
+        "Acute Occupancy %": tip,
+        "ICU Occupancy %": tip,
+        "Beds free": tip,
+        "ICU free": tip,
+    }
+
+
 def status_cell_style(label: str) -> str:
     if label not in STATUS_LABELS:
         return ""
@@ -187,19 +216,32 @@ def fmt_int(value: float) -> str:
     return f"{value:,.0f}" if pd.notna(value) else "N/A"
 
 
-def kpi_card(label: str, value: str, bucket: int | None = None) -> None:
+def info_icon_html(tooltip: str, color: str = "#787670") -> str:
+    """A small (i) with a native browser tooltip on hover -- no JS/CSS library needed,
+    works the same in any HTML context (custom cards, table captions, etc.)."""
+    safe_tooltip = html.escape(tooltip, quote=True)
+    return (
+        f'<span title="{safe_tooltip}" style="display:inline-block;width:14px;height:14px;'
+        f'border-radius:50%;border:1.5px solid {color};color:{color};font-size:10px;'
+        f'line-height:13px;text-align:center;cursor:help;margin-left:5px;'
+        f'font-weight:700;font-family:Georgia,serif;">i</span>'
+    )
+
+
+def kpi_card(label: str, value: str, bucket: int | None = None, tooltip: str | None = None) -> None:
     if bucket is None:
         bg, fg = "#fcfcfb", "#0b0b0b"
         border = "1px solid #e1e0d9"
     else:
         bg, fg = STATUS_COLORS[bucket]
         border = "none"
+    icon = info_icon_html(tooltip, color=fg) if tooltip else ""
     st.markdown(
         f"""
         <div style="background:{bg};border:{border};border-radius:10px;
                      padding:16px 18px;margin-bottom:10px;">
             <div style="font-size:28px;color:{fg};font-weight:700;">{value}</div>
-            <div style="font-size:13px;color:{fg};opacity:0.85;margin-top:2px;">{label}</div>
+            <div style="font-size:13px;color:{fg};opacity:0.85;margin-top:2px;">{label}{icon}</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -269,14 +311,19 @@ def searchable_text(rows: pd.DataFrame) -> pd.Series:
 
 
 def filter_bar(rows: pd.DataFrame, key_prefix: str, search_placeholder: str) -> pd.DataFrame:
-    c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+    c1, c2, c3, c4, c5 = st.columns([2, 1, 1, 1, 1])
     with c1:
         search = st.text_input(search_placeholder, key=f"{key_prefix}_search", label_visibility="collapsed", placeholder=search_placeholder)
     with c2:
         region = st.selectbox("Region", ["All regions"] + sorted(rows["Region"].unique()), key=f"{key_prefix}_region")
     with c3:
-        htype = st.selectbox("Hospital type", ["All types"] + sorted(rows["Hospital Type"].unique()), key=f"{key_prefix}_type")
+        county_raw_options = sorted(rows["Facility County"].dropna().unique())
+        county_label_to_raw = {c.title(): c for c in county_raw_options}
+        county_display = st.selectbox("County", ["All counties"] + sorted(county_label_to_raw.keys()), key=f"{key_prefix}_county")
+        county = county_label_to_raw.get(county_display)
     with c4:
+        htype = st.selectbox("Hospital type", ["All types"] + sorted(rows["Hospital Type"].unique()), key=f"{key_prefix}_type")
+    with c5:
         status = st.selectbox("Capacity status", ["All statuses"] + STATUS_LABELS, key=f"{key_prefix}_status")
 
     filtered = rows.copy()
@@ -284,6 +331,8 @@ def filter_bar(rows: pd.DataFrame, key_prefix: str, search_placeholder: str) -> 
         filtered = filtered[searchable_text(filtered).str.contains(search.lower())]
     if region != "All regions":
         filtered = filtered[filtered["Region"] == region]
+    if county:
+        filtered = filtered[filtered["Facility County"] == county]
     if htype != "All types":
         filtered = filtered[filtered["Hospital Type"] == htype]
     if status != "All statuses":
@@ -292,6 +341,84 @@ def filter_bar(rows: pd.DataFrame, key_prefix: str, search_placeholder: str) -> 
             [worst_status_bucket(a, i) == bucket for a, i in zip(filtered["Acute Occupancy %"], filtered["ICU Occupancy %"])]
         ]
     return filtered
+
+
+class DashboardQuery(BaseModel):
+    """Structured shape an LLM call must fill in from a free-text search request.
+    The LLM only ever returns this -- never hospital names, numbers, or prose --
+    so parsing user intent can't accidentally leak into what looks like analysis."""
+
+    region: Optional[str] = None
+    county: Optional[str] = None
+    hospital_type: Optional[str] = None
+    status: Optional[Literal["Available", "High occupancy", "Critical"]] = None
+    sort_metric: Literal["Acute Occupancy %", "ICU Occupancy %", "Available Acute Beds", "Available ICU Beds"] = "Acute Occupancy %"
+    sort_order: Literal["asc", "desc"] = "desc"
+
+
+SORT_COLUMN_MAP = {
+    "Acute Occupancy %": "Acute Occupancy %",
+    "ICU Occupancy %": "ICU Occupancy %",
+    "Available Acute Beds": "Total Staffed Acute Care Beds Available",
+    "Available ICU Beds": "Total Staffed ICU Beds Currently Available",
+}
+
+
+def best_match(value: str | None, choices: list[str]) -> str | None:
+    """Loose match for an LLM-returned region/type string against real column
+    values (exact, then substring, then NYC borough alias) -- an LLM could return
+    "Brooklyn" when the real region label is "New York City", and a close-but-not-
+    exact match should still apply rather than silently dropping the whole filter."""
+    if not value:
+        return None
+    value_lower = value.lower()
+    for choice in choices:
+        if choice.lower() == value_lower:
+            return choice
+    for choice in choices:
+        if value_lower in choice.lower() or choice.lower() in value_lower:
+            return choice
+    borough_names_lower = {b.lower() for b in NYC_BOROUGH_MAP.values()}
+    if value_lower in borough_names_lower and "New York City" in choices:
+        return "New York City"
+    return None
+
+
+def get_gemini_api_key() -> str | None:
+    # st.secrets raises rather than returning None when no secrets.toml exists at
+    # all (verified directly -- not the behavior you'd assume from a Mapping), so
+    # the search feature must stay usable with no key configured at all.
+    try:
+        return st.secrets.get("GOOGLE_API_KEY")
+    except Exception:
+        return None
+
+
+def parse_dashboard_query(text: str) -> DashboardQuery | None:
+    """Turns free text into a DashboardQuery via Gemini structured output. Returns
+    None on any failure (missing key, network error, bad response) so the caller
+    can fall back to the plain dropdown filters -- the app must stay fully usable
+    even when the LLM is unavailable."""
+    api_key = get_gemini_api_key()
+    if not api_key:
+        return None
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=(
+                "Parse this hospital-dashboard search request into structured filters. "
+                "Only set fields the request actually implies; leave the rest at their defaults.\n\n"
+                f"Request: {text}"
+            ),
+            config=genai_types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=DashboardQuery,
+            ),
+        )
+        return response.parsed
+    except Exception:
+        return None
 
 
 def open_detail(pfi, return_page: str) -> None:
@@ -438,11 +565,18 @@ def render_choropleth_map(rows: pd.DataFrame) -> None:
     st.caption(f"{len(plot_df)} counties shown, colored by weighted acute occupancy. Choropleth has no drill-down -- use the Markers view to open a hospital's detail page.")
 
 
-def render_hospital_table(rows: pd.DataFrame, key: str, columns: list[str] | None = None) -> None:
-    cols = columns or ["Facility Name", "Region", "Total Staffed Acute Care Beds Available", "Total Staffed ICU Beds Currently Available", "Acute Occupancy %", "Status"]
+def render_hospital_table(
+    rows: pd.DataFrame,
+    key: str,
+    columns: list[str] | None = None,
+    sort_column: str = "Acute Occupancy %",
+    ascending: bool = False,
+) -> None:
+    cols = columns or ["Facility Name", "Region", "County", "Total Staffed Acute Care Beds Available", "Total Staffed ICU Beds Currently Available", "Acute Occupancy %", "Status"]
     table = rows.copy()
+    table["County"] = table["Facility County"].str.title()
     table["Status"] = [status_label(worst_status_bucket(a, i)) for a, i in zip(table["Acute Occupancy %"], table["ICU Occupancy %"])]
-    table = table.sort_values("Acute Occupancy %", ascending=False).reset_index(drop=True)
+    table = table.sort_values(sort_column, ascending=ascending).reset_index(drop=True)
     display = table[cols].rename(
         columns={
             "Facility Name": "Hospital",
@@ -451,9 +585,11 @@ def render_hospital_table(rows: pd.DataFrame, key: str, columns: list[str] | Non
             "Acute Occupancy %": "Occupancy",
         }
     )
-    st.caption(f"{len(display)} hospitals — sorted by occupancy. Click a column header to re-sort.")
+    sort_label = "occupancy" if "Occupancy" in sort_column else sort_column.lower()
+    st.caption(f"{len(display)} hospitals — sorted by {sort_label} ({'lowest first' if ascending else 'highest first'}). Click a column header to re-sort.")
     event = st.dataframe(
         display.style.format({"Occupancy": "{:.1f}%"}).map(status_cell_style, subset=["Status"]),
+        column_config=occupancy_column_config(),
         width="stretch",
         hide_index=True,
         on_select="rerun",
@@ -533,12 +669,12 @@ if st.session_state.detail_pfi is not None:
     change = hosp["Acute Occupancy %"] - prev_row["Acute Occupancy %"].iloc[0] if not prev_row.empty else np.nan
 
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric("Occupancy", fmt_pct(hosp["Acute Occupancy %"]))
-    k2.metric("Beds free", fmt_int(hosp["Total Staffed Acute Care Beds Available"]))
-    k3.metric("ICU beds free", fmt_int(hosp["Total Staffed ICU Beds Currently Available"]))
+    k1.metric("Occupancy", fmt_pct(hosp["Acute Occupancy %"]), help=OVER_100_NOTE)
+    k2.metric("Beds free", fmt_int(hosp["Total Staffed Acute Care Beds Available"]), help=OVER_100_NOTE)
+    k3.metric("ICU beds free", fmt_int(hosp["Total Staffed ICU Beds Currently Available"]), help=OVER_100_NOTE)
     k4.metric("24h change", f"{change:+.1f} pts" if pd.notna(change) else "N/A")
     if hosp["Acute Occupancy %"] > 100 or hosp["ICU Occupancy %"] > 100:
-        st.caption(OVER_100_NOTE)
+        st.caption("This hospital is reporting more occupied beds than staffed beds as of this date -- hover Occupancy or Beds free above for what that means.")
 
     chart_col, side_col = st.columns([2, 1])
     with chart_col:
@@ -611,7 +747,7 @@ if active_page == "Overview":
     with k1:
         kpi_card("Hospitals monitored", f"{len(filtered):,}")
     with k2:
-        kpi_card("Average occupancy", fmt_pct(avg_occ))
+        kpi_card("Average occupancy", fmt_pct(avg_occ), tooltip=OVER_100_NOTE)
     with k3:
         kpi_card("Near capacity", f"{near_capacity}", bucket=1)
     with k4:
@@ -647,12 +783,12 @@ if active_page == "Overview":
                 """,
                 unsafe_allow_html=True,
             )
-        st.markdown("**Highest pressure**")
+        st.markdown(f"**Highest pressure** {info_icon_html(OVER_100_NOTE)}", unsafe_allow_html=True)
         top5 = filtered.sort_values("Acute Occupancy %", ascending=False).head(5)
         for i, (_, row) in enumerate(top5.iterrows(), start=1):
             st.write(f"{i}. {row['Facility Name']} — {fmt_pct(row['Acute Occupancy %'])}")
 
-    st.caption("Pressure colors are illustrative analytical thresholds, not medical or regulatory standards. " + OVER_100_NOTE)
+    st.caption("Pressure colors are illustrative analytical thresholds, not medical or regulatory standards.")
 
 # ---------------------------------------------------------------------------
 # Hospitals
@@ -660,9 +796,57 @@ if active_page == "Overview":
 
 elif active_page == "Hospitals":
     st.markdown("#### Hospitals")
+
+    with st.form("ai_search_form"):
+        ai_col, button_col = st.columns([5, 1])
+        with ai_col:
+            ai_query = st.text_input(
+                "Ask in plain English (optional)",
+                placeholder='e.g. "critical hospitals in Brooklyn with the fewest ICU beds free"',
+                key="hosp_ai_query",
+            )
+        with button_col:
+            st.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+            ai_submitted = st.form_submit_button("Search")
+
+    if ai_submitted and ai_query:
+        parsed = parse_dashboard_query(ai_query)
+        if parsed is None:
+            st.warning("AI search is unavailable right now (no API key configured, or the request failed) -- use the filters below instead.")
+        else:
+            region_match = best_match(parsed.region, sorted(df["Region"].unique()))
+            county_match = best_match(parsed.county, sorted(df["Facility County"].dropna().unique()))
+            type_match = best_match(parsed.hospital_type, sorted(df["Hospital Type"].unique()))
+            st.session_state["hosp_region"] = region_match or "All regions"
+            # The County selectbox's options are title-cased for display ("Kings"), but
+            # Facility County itself is stored uppercase ("KINGS") -- best_match above
+            # runs against the raw values, so convert back to the display form the
+            # widget actually holds in session_state before assigning it.
+            st.session_state["hosp_county"] = county_match.title() if county_match else "All counties"
+            st.session_state["hosp_type"] = type_match or "All types"
+            st.session_state["hosp_status"] = parsed.status or "All statuses"
+            st.session_state["hosp_search"] = ""
+            st.session_state["hosp_sort_metric"] = parsed.sort_metric
+            st.session_state["hosp_sort_order"] = parsed.sort_order
+            st.caption(
+                f"Showing: {parsed.status or 'all'} hospitals"
+                + (f" in {region_match}" if region_match else "")
+                + (f", {county_match.title()} County" if county_match else "")
+                + (f", type {type_match}" if type_match else "")
+                + f", sorted by {parsed.sort_metric} ({parsed.sort_order}ending)."
+            )
+
+    sort_metric = st.session_state.get("hosp_sort_metric", "Acute Occupancy %")
+    sort_order = st.session_state.get("hosp_sort_order", "desc")
+
     filtered = filter_bar(df, "hosp", "Search by hospital or borough...")
-    render_hospital_table(filtered, key="hospitals_table")
-    st.caption("Pressure colors are illustrative analytical thresholds, not medical or regulatory standards. " + OVER_100_NOTE)
+    render_hospital_table(
+        filtered,
+        key="hospitals_table",
+        sort_column=SORT_COLUMN_MAP[sort_metric],
+        ascending=(sort_order == "asc"),
+    )
+    st.caption("Pressure colors are illustrative analytical thresholds, not medical or regulatory standards. Hover an Occupancy/Beds free column header for what a value over 100% or below 0 means.")
 
 # ---------------------------------------------------------------------------
 # Trends
@@ -696,11 +880,21 @@ elif active_page == "Trends":
         st.plotly_chart(fig, width="stretch")
 
     with side_col:
-        st.markdown("##### By region")
-        by_region = metric_snapshot(df, metric, group_col="Region").sort_values(ascending=False)
+        group_choice = st.segmented_control("Group by", ["Region", "County"], default="Region", key="trends_group_by", label_visibility="collapsed") or "Region"
         fmt = fmt_pct if METRICS[metric]["kind"] == "pct" else fmt_int
-        for region, value in by_region.items():
-            st.write(f"{region} — **{fmt(value)}**")
+        if group_choice == "Region":
+            st.markdown("##### By region")
+            by_group = metric_snapshot(df, metric, group_col="Region").sort_values(ascending=False)
+            for group, value in by_group.items():
+                st.write(f"{group} — **{fmt(value)}**")
+        else:
+            st.markdown("##### By county (top 10)")
+            county_snapshot = df.copy()
+            county_snapshot["County"] = county_snapshot["Facility County"].str.title()
+            by_group = metric_snapshot(county_snapshot, metric, group_col="County").sort_values(ascending=False).head(10)
+            for group, value in by_group.items():
+                st.write(f"{group} — **{fmt(value)}**")
+            st.caption("35% of NY counties have only one reporting hospital, so a county's figure there is really just that hospital's own number.")
 
         st.markdown("##### Key change")
         start_val = series[metric].iloc[0] if len(series) else np.nan
@@ -747,6 +941,7 @@ elif active_page == "Compare":
         )
         st.dataframe(
             display.style.format({"Acute Occupancy %": "{:.1f}%", "ICU Occupancy %": "{:.1f}%"}).map(status_cell_style, subset=["Status"]),
+            column_config=occupancy_column_config(),
             width="stretch",
             hide_index=True,
         )
@@ -784,6 +979,9 @@ elif active_page == "About Data":
             "- **Beds free / ICU free** = staffed beds currently available, as self-reported by each facility."
         )
         st.divider()
+        st.markdown("**Occupancy over 100% and negative \"beds free\"**")
+        st.write(OVER_100_NOTE)
+        st.divider()
         st.markdown("**Methodology**")
         st.write(
             "Regional, network, and statewide occupancy figures are weighted (total occupied beds ÷ total staffed beds "
@@ -795,10 +993,9 @@ elif active_page == "About Data":
         st.markdown("**Limitations**")
         st.write(
             "The dataset does not include staffing levels, patient acuity, specialty availability, hospital finances, "
-            "or transfer feasibility. Reported capacity may lag real-time operational conditions, and a handful of "
-            "hospitals report occupancy above 100% (see the note on the Overview and Hospitals pages). This app "
-            "identifies where capacity pressure exists; it does not diagnose the cause or prescribe a specific "
-            "intervention."
+            "or transfer feasibility. Reported capacity may lag real-time operational conditions (see above for why "
+            "occupancy can read above 100%). This app identifies where capacity pressure exists; it does not "
+            "diagnose the cause or prescribe a specific intervention."
         )
 
     with right:
