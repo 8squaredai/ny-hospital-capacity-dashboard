@@ -194,6 +194,22 @@ def status_cell_style(label: str) -> str:
     return f"background-color: {bg}; color: {fg}; border-radius: 999px; font-weight: 600; text-align: center;"
 
 
+def html_progress_bar(fraction: float, bucket: int | None) -> None:
+    """A colored progress bar matching the app's status palette -- st.progress()
+    has no color parameter, so this renders the same visual language (green/
+    amber/red) instead of a flat default-blue bar regardless of intensity."""
+    pct = min(max(fraction, 0), 1) * 100
+    color = STATUS_MAP_COLORS.get(bucket, "#898781")
+    st.markdown(
+        f"""
+        <div style="background:#e7e6e2;border-radius:999px;height:10px;margin:4px 0 14px 0;overflow:hidden;">
+            <div style="background:{color};width:{pct:.1f}%;height:100%;border-radius:999px;"></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def status_badge_html(bucket: int | None, uppercase: bool = False, suffix: str = "") -> str:
     if bucket is None:
         bg, fg, text = "#e7e6e2", "#52514e", "N/A"
@@ -427,7 +443,17 @@ def open_detail(pfi, return_page: str) -> None:
     st.rerun()
 
 
+NY_CENTER = {"lat": 42.9, "lon": -75.5}
+
+
 def render_marker_map(rows: pd.DataFrame, key: str, zoom: float = 5.7, center: dict | None = None) -> None:
+    # Explicit default rather than relying on Plotly's auto-center-from-data
+    # behavior -- that behavior varies across Plotly versions (requirements.txt
+    # only pins plotly>=5.24, a loose floor), and on at least one resolved
+    # version it defaulted to (0, 0) -- the middle of the Gulf of Guinea --
+    # instead of fitting to the NY hospital points, even though the same code
+    # centered correctly with the locally pinned version.
+    center = center or NY_CENTER
     map_df = rows.dropna(subset=["Latitude", "Longitude"]).copy()
     excluded = len(rows) - len(map_df)
     if map_df.empty:
@@ -692,13 +718,15 @@ if st.session_state.detail_pfi is not None:
         st.markdown("#### Bed availability")
         acute_frac = hosp["Total Staffed Acute Care Beds Occupied"] / hosp["Total Staffed Acute Care Beds"] if hosp["Total Staffed Acute Care Beds"] else 0
         icu_frac = hosp["Total Staffed ICU Beds Currently Occupied"] / hosp["Total Staffed ICU Beds"] if hosp["Total Staffed ICU Beds"] else 0
+        acute_bucket = status_bucket(hosp["Acute Occupancy %"])
+        icu_bucket = status_bucket(hosp["ICU Occupancy %"])
         st.write(f"General beds — {fmt_int(hosp['Total Staffed Acute Care Beds Available'])} / {fmt_int(hosp['Total Staffed Acute Care Beds'])} free")
-        st.progress(min(max(acute_frac, 0), 1))
+        html_progress_bar(acute_frac, acute_bucket)
         st.write(f"ICU beds — {fmt_int(hosp['Total Staffed ICU Beds Currently Available'])} / {fmt_int(hosp['Total Staffed ICU Beds'])} free")
-        st.progress(min(max(icu_frac, 0), 1))
+        html_progress_bar(icu_frac, icu_bucket)
         emergency_label = {0: "Low pressure", 1: "Moderate pressure", 2: "High pressure"}.get(bucket, "N/A")
         st.write(f"Emergency pressure (proxy) — {emergency_label}")
-        st.progress(min(max(acute_frac, 0), 1))
+        html_progress_bar(acute_frac, bucket)
         st.caption("Derived from acute occupancy -- the dataset does not include emergency-department-specific data.")
 
     st.markdown("#### Hospital information")
