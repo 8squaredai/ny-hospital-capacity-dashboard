@@ -394,9 +394,18 @@ def best_match(value: str | None, choices: list[str]) -> str | None:
     for choice in choices:
         if value_lower in choice.lower() or choice.lower() in value_lower:
             return choice
-    borough_names_lower = {b.lower() for b in NYC_BOROUGH_MAP.values()}
-    if value_lower in borough_names_lower and "New York City" in choices:
-        return "New York City"
+    # NYC borough alias -- resolves into whichever target space `choices`
+    # represents. Previously this only ever returned "New York City" (a Region
+    # value), so a borough name matched fine against Region choices but always
+    # failed against County choices (e.g. "Brooklyn" never resolved to "KINGS"),
+    # silently dropping the filter whenever an LLM classified it as a county.
+    borough_to_county = {b.lower(): county for county, b in NYC_BOROUGH_MAP.items()}
+    county_code = borough_to_county.get(value_lower)
+    if county_code:
+        if county_code in choices:
+            return county_code
+        if "New York City" in choices:
+            return "New York City"
     return None
 
 
@@ -701,6 +710,15 @@ if st.session_state.detail_pfi is not None:
     k4.metric("24h change", f"{change:+.1f} pts" if pd.notna(change) else "N/A")
     if hosp["Acute Occupancy %"] > 100 or hosp["ICU Occupancy %"] > 100:
         st.caption("This hospital is reporting more occupied beds than staffed beds as of this date -- hover Occupancy or Beds free above for what that means.")
+
+    st.markdown("#### Acute occupancy in context")
+    region_occ = metric_snapshot(df[df["Region"] == hosp["Region"]], "Acute Occupancy %")
+    state_occ = metric_snapshot(df, "Acute Occupancy %")
+    ctx1, ctx2, ctx3 = st.columns(3)
+    ctx1.metric("This hospital", fmt_pct(hosp["Acute Occupancy %"]))
+    ctx2.metric(f"{hosp['Region']} region", fmt_pct(region_occ))
+    ctx3.metric("Statewide", fmt_pct(state_occ))
+    st.caption("Region and statewide figures are weighted (total occupied ÷ total staffed beds across the group), not averaged.")
 
     chart_col, side_col = st.columns([2, 1])
     with chart_col:
