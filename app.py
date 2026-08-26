@@ -1013,9 +1013,13 @@ elif active_page == "About Data":
         st.divider()
         st.markdown("**Update frequency**")
         st.write(
-            f"This app loads a downloaded snapshot of the dataset covering {history_df['As of Date'].nunique()} daily "
+            f"This app loads a snapshot of the dataset covering {history_df['As of Date'].nunique()} daily "
             f"reporting dates, from {history_df['As of Date'].min().strftime('%B %d, %Y')} to {latest_date.strftime('%B %d, %Y')}. "
-            "The app does not fetch live data; refreshing it requires downloading a new export."
+            "It does not query NY DOH live on each page load. Instead, a scheduled GitHub Actions "
+            "workflow runs daily, downloads the full current export, and commits it back to the "
+            "repository only if the data actually changed. Streamlit Community Cloud detects that "
+            "commit and automatically reboots the app, so the snapshot above stays current without "
+            "anyone manually re-downloading anything."
         )
         st.divider()
         st.markdown("**Definitions**")
